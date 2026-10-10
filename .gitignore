@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# PyCharm per-user files (shared project settings stay tracked)
+.idea/workspace.xml
+.idea/shelf/
+.idea/usage.statistics.xml
+.idea/dataSources*
+.idea/httpRequests/
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store
