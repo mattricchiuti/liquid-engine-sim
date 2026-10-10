@@ -19,6 +19,10 @@ dist/
 .idea/dataSources*
 .idea/httpRequests/
 
+# LibreOffice / Excel lock files while a spreadsheet is open
+.~lock.*#
+~$*
+
 # OS clutter
 Thumbs.db
 Desktop.ini
