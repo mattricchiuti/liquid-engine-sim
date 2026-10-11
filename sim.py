@@ -2,14 +2,16 @@ import csv
 import itertools
 import math
 import os
+import time
+import webbrowser
+from pathlib import Path
 
-import matplotlib.pyplot as plt                   # plotting
-from matplotlib.colors import LinearSegmentedColormap
 import numpy as np                                # arrays and math on whole time histories
 import openpyxl                                   # reading input.xlsx
+import plotly.graph_objects as go                 # interactive plots (web pages)
+from plotly.subplots import make_subplots
 from CoolProp.CoolProp import PropsSI             # N2O properties: PropsSI(output, in1, v1, in2, v2, "NitrousOxide")
 from rocketcea.cea_obj_w_units import CEA_Obj     # NASA CEA (SI-units version): c*, Tc, gamma, MW vs. Pc and O/F
-from scipy.optimize import brentq                 # root finding, e.g. the chamber pressure / mass flow balance
 
 INPUT_FILE = "input.xlsx"
 
@@ -640,8 +642,10 @@ def run(inputs, progress_every=100):
 
         step += 1
         if progress_every and step % progress_every == 0:
-            print(f"  t = {t:6.2f} s   F = {nz['F']:7.1f} N   Pc = {cb['Pc'] / 6894.757:5.1f} psi   "
-                  f"ox left = {m_ox / ic['m_ox0']:5.1%}")
+            # The end time isn't known in advance; progress = how close the first tank is to empty
+            used = max(1 - m_ox / ic["m_ox0"], 1 - m_fuel / ic["m_fuel0"])
+            print(f"  {used:4.0%} propellant used   t = {t:5.2f} s   F = {nz['F']:6.0f} N   "
+                  f"Pc = {cb['Pc'] / 6894.757:5.1f} psi")
 
     history = {name: np.array(values) for name, values in history.items()}
 
@@ -683,6 +687,7 @@ def run_sweeps(inputs, sweeps):
     """
     cases = []
     combos = list(itertools.product(*[range(len(s["values"])) for s in sweeps]))
+    start = time.perf_counter()
     for n, idx in enumerate(combos, start=1):
         case_inputs = dict(inputs)
         for s, k in zip(sweeps, idx):
@@ -692,13 +697,24 @@ def run_sweeps(inputs, sweeps):
         try:
             result = run(case_inputs, progress_every=0)
             sm = result["summary"]
-            print(f"[{n}/{len(combos)}] {label}: {sm['motor']}, I = {sm['total_impulse']:.0f} N*s, "
-                  f"Isp = {sm['average_Isp']:.0f} s ({sm['stop_reason']})")
+            outcome = (f"{sm['motor']}, I = {sm['total_impulse']:.0f} N*s, "
+                       f"Isp = {sm['average_Isp']:.0f} s ({sm['stop_reason']})")
             cases.append({"index": idx, "values": values, "result": result})
         except Exception as e:  # an extreme design shouldn't stop the whole sweep
-            print(f"[{n}/{len(combos)}] {label}: FAILED ({e})")
+            outcome = f"FAILED ({e})"
             cases.append({"index": idx, "values": values, "result": None, "error": str(e)})
+
+        elapsed = time.perf_counter() - start
+        remaining = elapsed / n * (len(combos) - n)
+        print(f"[{n}/{len(combos)} {n / len(combos):4.0%}, ~{format_duration(remaining)} left] {label}: {outcome}")
+    print(f"Sweep done in {format_duration(time.perf_counter() - start)}")
     return cases
+
+
+def format_duration(seconds):
+    """e.g. 75 -> '1m15s', 8 -> '8s'."""
+    seconds = round(seconds)
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
 SWEEP_METRICS = [  # (summary key, label, scale)
@@ -728,204 +744,207 @@ def save_sweep_csv(sweeps, cases, path="outputs/sweep_results.csv"):
                        + [f"{sm[key] * scale:.6g}" for key, _, scale in SWEEP_METRICS])
 
 
-def plot_sweep(sweeps, cases, path="outputs/sweep.png"):
-    """One sweep: thrust and chamber pressure curves per value, plus summary metrics vs. the value.
+# ---------- plotting (interactive web pages: hover for values, drag to zoom, double-click to reset) ----------
+PSI = 6894.757  # Pa per psi
+
+# Fixed categorical order (colorblind-validated reference palette): series keep their color across plots
+CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+SEQUENTIAL = ["#cde2fb", "#86b6ef", "#2a78d6", "#1c5cab", "#104281"]  # light -> dark blue, for ordered values
+GUIDE_COLOR = "#8a8a86"  # reference lines (ambient, guidelines)
+OPEN_IN_BROWSER = True   # open each page when it's written
+
+
+def sequential_colors(n):
+    """n colors from light to dark blue, for ordered values such as a sweep (skips the palest step)."""
+    stops = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in SEQUENTIAL]
+    colors = []
+    for k in range(n):
+        x = (0.3 + 0.7 * k / max(n - 1, 1)) * (len(stops) - 1)
+        i = min(int(x), len(stops) - 2)
+        f = x - i
+        rgb = [round(a + (b - a) * f) for a, b in zip(stops[i], stops[i + 1])]
+        colors.append("#%02x%02x%02x" % tuple(rgb))
+    return colors
+
+
+def save_page(fig, path, title):
+    """Write the figure as a standalone web page (works offline) and optionally open it."""
+    fig.update_layout(title=title, template="plotly_white", font=dict(size=12),
+                      margin=dict(l=60, r=30, t=90, b=40))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.write_html(path, include_plotlyjs=True)
+    if OPEN_IN_BROWSER:
+        webbrowser.open(Path(path).resolve().as_uri())
+    return path
+
+
+def panel_legend(fig, n, row, col, title=None, corner="right"):
+    """Give one subplot its own legend (the n-th, counting from 1) in its top-right (or top-left)
+    corner; returns the legend id to put on its traces."""
+    lid = "legend" if n == 1 else f"legend{n}"
+    sp = fig.get_subplot(row, col)
+    x = sp.xaxis.domain[1] if corner == "right" else sp.xaxis.domain[0] + 0.01
+    fig.update_layout(**{lid: dict(x=x, y=sp.yaxis.domain[1], xanchor=corner, yanchor="top",
+                                   bgcolor="rgba(255,255,255,0.8)", font=dict(size=10),
+                                   title=dict(text=title) if title else None)})
+    return lid
+
+
+def line(fig, row, col, x, y, name, color, dash=None, hover_unit="", legend=None):
+    """A line on one subplot; it appears in that subplot's legend if one is given."""
+    fig.add_trace(go.Scatter(x=x, y=y, name=name, mode="lines", line=dict(color=color, width=2, dash=dash),
+                             showlegend=legend is not None, legend=legend or "legend",
+                             hovertemplate=f"{name}: %{{y:.4g}} {hover_unit}<extra></extra>"), row=row, col=col)
+
+
+def plot_results(result, path="outputs/results.html"):
+    """Single run: thrust, pressures, stiffness, flows, O/F, Isp, propellant, c*, Tc, exit pressure vs. time."""
+    h, s = result["history"], result["summary"]
+    t = h["t"]
+    burn = t >= STARTUP_TIME  # during the ramp Pc is near ambient, so ratios like stiffness spike meaninglessly
+    tb = t[burn]
+    blue, orange, aqua, yellow, magenta = CATEGORICAL[:5]
+
+    titles = ["Thrust [N]", "Pressure [psi]", "Injector stiffness [%]", "Mass flow [kg/s]", "O/F",
+              "Isp [s]", "Propellant left [kg]", "c* with efficiency [m/s]", "Chamber temperature [K]",
+              "Nozzle exit pressure [psi]"]
+    fig = make_subplots(rows=5, cols=2, shared_xaxes=True, subplot_titles=titles,
+                        vertical_spacing=0.05, horizontal_spacing=0.08)
+
+    lg = panel_legend(fig, 1, 1, 1)
+    line(fig, 1, 1, t, h["F"], "total", blue, hover_unit="N", legend=lg)
+    line(fig, 1, 1, t, h["F_momentum"], "momentum", orange, "dash", "N", legend=lg)
+    line(fig, 1, 1, t, h["F_pressure"], "pressure", aqua, "dot", "N", legend=lg)
+
+    lg = panel_legend(fig, 2, 1, 2)
+    for (key, name), color in zip([("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("P_man_ox", "ox manifold"),
+                                   ("P_man_fuel", "fuel manifold"), ("Pc", "chamber")], CATEGORICAL):
+        line(fig, 1, 2, t, h[key] / PSI, name, color, hover_unit="psi", legend=lg)
+
+    lg = panel_legend(fig, 3, 2, 1)
+    line(fig, 2, 1, tb, h["stiffness_ox"][burn] * 100, "oxidizer", blue, hover_unit="%", legend=lg)
+    line(fig, 2, 1, tb, h["stiffness_fuel"][burn] * 100, "fuel", orange, hover_unit="%", legend=lg)
+    fig.add_hline(y=30, line=dict(color=GUIDE_COLOR, dash="dot"), annotation_text="30% guideline", row=2, col=1)
+
+    lg = panel_legend(fig, 4, 2, 2)
+    line(fig, 2, 2, t, h["mdot_ox"], "oxidizer", blue, hover_unit="kg/s", legend=lg)
+    line(fig, 2, 2, t, h["mdot_fuel"], "fuel", orange, hover_unit="kg/s", legend=lg)
+    line(fig, 3, 1, tb, h["OF"][burn], "O/F", blue)
+    line(fig, 3, 2, tb, h["Isp"][burn], "Isp", blue, hover_unit="s")
+    lg = panel_legend(fig, 5, 4, 1)
+    line(fig, 4, 1, t, h["m_ox"], "oxidizer", blue, hover_unit="kg", legend=lg)
+    line(fig, 4, 1, t, h["m_fuel"], "fuel", orange, hover_unit="kg", legend=lg)
+    line(fig, 4, 2, tb, h["cstar"][burn], "c*", blue, hover_unit="m/s")
+    line(fig, 5, 1, tb, h["Tc"][burn], "chamber temperature", blue, hover_unit="K")
+    line(fig, 5, 2, tb, h["Pe"][burn] / PSI, "exit pressure", blue, hover_unit="psi")
+    Pa = s["ambient_pressure"] / PSI
+    fig.add_hline(y=Pa, line=dict(color=GUIDE_COLOR, dash="dash"), annotation_text="ambient", row=5, col=2)
+    fig.add_hline(y=SEPARATION_RATIO * Pa, line=dict(color=GUIDE_COLOR, dash="dot"),
+                  annotation_text="separation risk", row=5, col=2)
+
+    for col in (1, 2):
+        fig.update_xaxes(title_text="Time [s]", row=5, col=col)
+    fig.update_layout(height=1600, hovermode="x unified")
+    title = (f"{s['motor']}   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
+             f"Isp = {s['average_Isp']:.0f} s   (stop: {s['stop_reason']})")
+    return save_page(fig, path, title)
+
+
+def plot_sweep(sweeps, cases, path="outputs/sweep.html"):
+    """One sweep: curves over time for every value, plus summary metrics vs. the value.
     Two sweeps: a heat map of each summary metric over the grid."""
     if len(sweeps) == 1:
         return _plot_sweep_1d(sweeps[0], cases, path)
     return _plot_sweep_2d(sweeps, cases, path)
 
 
-def _plot_sweep_1d(sweep, cases, path):
+def _plot_sweep_1d(sweep, cases, path, max_legend=12):
     ok = [c for c in cases if c["result"] is not None]
     colors = sequential_colors(len(ok))
     unit = f" [{sweep['unit']}]" if sweep["unit"] else ""
+    label = f"{sweep['parameter']}{unit}"
     x = [c["values"][0] for c in ok]
 
-    fig, ax = plt.subplots(2, 3, figsize=(16, 8.5))
-    fig.suptitle(f"Sweep: {sweep['parameter']}{unit}")
+    curves = [("F", "Thrust [N]", 1, False), ("Pc", "Chamber pressure [psi]", 1 / PSI, False),
+              ("OF", "O/F", 1, True), ("stiffness_ox", "Oxidizer injector stiffness [%]", 100, True),
+              ("stiffness_fuel", "Fuel injector stiffness [%]", 100, True)]
+    metrics = [  # (title, [(summary key, scale, series name, color)])
+        ("Total impulse [N·s]", [("total_impulse", 1, "total impulse", CATEGORICAL[0])]),
+        ("Average Isp [s]", [("average_Isp", 1, "average Isp", CATEGORICAL[0])]),
+        ("Thrust [N]", [("average_thrust", 1, "average thrust", CATEGORICAL[0]),
+                        ("peak_thrust", 1, "peak thrust", CATEGORICAL[1])]),
+        ("Burn time [s]", [("burn_time", 1, "burn time", CATEGORICAL[0])]),
+        ("Minimum injector stiffness [%]", [("min_stiffness_ox", 100, "min ox stiffness", CATEGORICAL[0]),
+                                            ("min_stiffness_fuel", 100, "min fuel stiffness", CATEGORICAL[1])]),
+    ]
+    titles = [t for pair in zip([c[1] + " vs. time" for c in curves], [m[0] for m in metrics]) for t in pair]
+    fig = make_subplots(rows=5, cols=2, subplot_titles=titles, vertical_spacing=0.05, horizontal_spacing=0.08)
 
-    for a, (key, label, scale) in zip((ax[0, 0], ax[1, 0]), [("F", "Thrust [N]", 1), ("Pc", "Chamber pressure [psi]", 1 / PSI)]):
+    # Case values get a legend in the thrust panel (while there are few enough to list); clicking an
+    # entry toggles that case in every panel, since its curves share a legend group
+    n_legend = 1
+    values_legend = panel_legend(fig, n_legend, 1, 1, title=label) if len(ok) <= max_legend else None
+    for row, (key, title, scale, burn_only) in enumerate(curves, start=1):
         for c, color in zip(ok, colors):
             h = c["result"]["history"]
-            a.plot(h["t"], h[key] * scale, color=color, label=f"{c['values'][0]:g}")
-        a.set_ylabel(label)
-        a.set_xlabel("Time [s]")
-        a.legend(title=f"{sweep['parameter']}{unit}", fontsize=8, title_fontsize=8)
+            keep = h["t"] >= STARTUP_TIME if burn_only else np.ones_like(h["t"], bool)
+            v = c["values"][0]
+            fig.add_trace(go.Scatter(
+                x=h["t"][keep], y=h[key][keep] * scale, mode="lines", line=dict(color=color, width=1.5),
+                name=f"{v:g}", legendgroup=f"{v:g}", legend=values_legend or "legend",
+                showlegend=(row == 1 and values_legend is not None),
+                hovertemplate=f"{label} = {v:g}<br>t = %{{x:.2f}} s<br>%{{y:.4g}}<extra></extra>"), row=row, col=1)
+        fig.update_xaxes(title_text="Time [s]", row=row, col=1)
+    fig.add_hline(y=30, line=dict(color=GUIDE_COLOR, dash="dot"), annotation_text="30% guideline", row=4, col=1)
+    fig.add_hline(y=30, line=dict(color=GUIDE_COLOR, dash="dot"), annotation_text="30% guideline", row=5, col=1)
 
-    panels = [ax[0, 1], ax[0, 2], ax[1, 1], ax[1, 2]]
-    groups = [[SWEEP_METRICS[0]], [SWEEP_METRICS[3]], [SWEEP_METRICS[1], SWEEP_METRICS[2]],
-              [SWEEP_METRICS[5], SWEEP_METRICS[6]]]
-    titles = ["Total impulse [N·s]", "Average Isp [s]", "Thrust [N]", "Minimum injector stiffness [%]"]
-    names = {"average_thrust": "average", "peak_thrust": "peak",
-             "min_stiffness_ox": "oxidizer", "min_stiffness_fuel": "fuel"}
-    for a, group, title in zip(panels, groups, titles):
-        for key, label, scale in group:
-            a.plot(x, [c["result"]["summary"][key] * scale for c in ok], "o-", markersize=5,
-                   label=names.get(key, label))
-        a.set_ylabel(title)
-        a.set_xlabel(f"{sweep['parameter']}{unit}")
-        if len(group) > 1:
-            a.legend()
-    ax[1, 2].axhline(30, color=GUIDE_COLOR, ls=":", label="30% guideline")
-    ax[1, 2].legend()
+    for row, (title, series) in enumerate(metrics, start=1):
+        lg = None
+        if len(series) > 1:
+            n_legend += 1
+            lg = panel_legend(fig, n_legend, row, 2, corner="left")
+        for key, scale, name, color in series:
+            fig.add_trace(go.Scatter(
+                x=x, y=[c["result"]["summary"][key] * scale for c in ok], mode="lines+markers",
+                line=dict(color=color, width=2), marker=dict(size=7), name=name,
+                showlegend=lg is not None, legend=lg or "legend",
+                hovertemplate=f"{label} = %{{x:g}}<br>{name} = %{{y:.4g}}<extra></extra>"), row=row, col=2)
+        fig.update_xaxes(title_text=label, row=row, col=2)
+    fig.add_hline(y=30, line=dict(color=GUIDE_COLOR, dash="dot"), annotation_text="30% guideline", row=5, col=2)
 
-    finish(fig, ax, path)
-    return fig
+    fig.update_layout(height=1700, hovermode="closest")
+    note = "" if len(ok) <= max_legend else "   (hover a curve to see its value)"
+    return save_page(fig, path, f"Sweep: {label}, {len(ok)} cases{note}")
 
 
 def _plot_sweep_2d(sweeps, cases, path):
     s1, s2 = sweeps
-    unit1 = f" [{s1['unit']}]" if s1["unit"] else ""
-    unit2 = f" [{s2['unit']}]" if s2["unit"] else ""
-    shown = [SWEEP_METRICS[0], SWEEP_METRICS[3], SWEEP_METRICS[2], SWEEP_METRICS[4]]
+    label1 = f"{s1['parameter']}" + (f" [{s1['unit']}]" if s1["unit"] else "")
+    label2 = f"{s2['parameter']}" + (f" [{s2['unit']}]" if s2["unit"] else "")
+    shown = [SWEEP_METRICS[i] for i in (0, 3, 2, 4, 5, 6)]  # impulse, Isp, peak thrust, burn time, min stiffness x2
 
-    fig, ax = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"Sweep: {s1['parameter']} × {s2['parameter']}")
-    for a, (key, label, scale) in zip(ax.flat, shown):
+    fig = make_subplots(rows=3, cols=2, subplot_titles=[m[1] for m in shown],
+                        vertical_spacing=0.1, horizontal_spacing=0.14)
+    small = len(s1["values"]) * len(s2["values"]) <= 64  # print values in the cells only while they're readable
+    for n, (key, title, scale) in enumerate(shown):
+        row, col = n // 2 + 1, n % 2 + 1
         grid = np.full((len(s2["values"]), len(s1["values"])), np.nan)  # rows: sweep 2, columns: sweep 1
         for c in cases:
             if c["result"] is not None:
                 i1, i2 = c["index"]
                 grid[i2, i1] = c["result"]["summary"][key] * scale
-        im = a.imshow(grid, origin="lower", aspect="auto", cmap=SEQUENTIAL_CMAP)
-        a.set_xticks(range(len(s1["as_entered"])), [f"{v:g}" for v in s1["as_entered"]])
-        a.set_yticks(range(len(s2["as_entered"])), [f"{v:g}" for v in s2["as_entered"]])
-        a.set_xlabel(f"{s1['parameter']}{unit1}")
-        a.set_ylabel(f"{s2['parameter']}{unit2}")
-        a.set_title(label)
-        fig.colorbar(im, ax=a)
-        if grid.size <= 64:  # label cells only while they're big enough to read
-            lo, hi = np.nanmin(grid), np.nanmax(grid)
-            for (i2, i1), v in np.ndenumerate(grid):
-                if not np.isnan(v):
-                    dark = (v - lo) / (hi - lo + 1e-12) > 0.55
-                    a.text(i1, i2, f"{v:,.0f}" if abs(v) >= 100 else f"{v:.3g}", ha="center", va="center", fontsize=8,
-                           color="white" if dark else "black")
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=120)
-    return fig
+        fig.add_trace(go.Heatmap(
+            x=[f"{v:g}" for v in s1["as_entered"]], y=[f"{v:g}" for v in s2["as_entered"]], z=grid,
+            colorscale=[[i / (len(SEQUENTIAL) - 1), c] for i, c in enumerate(SEQUENTIAL)],
+            colorbar=dict(len=0.27, y=1 - (row - 0.5) / 3, x=0.43 if col == 1 else 1.0, thickness=12),
+            texttemplate="%{z:.4g}" if small else None,
+            hovertemplate=f"{label1} = %{{x}}<br>{label2} = %{{y}}<br>{title} = %{{z:.4g}}<extra></extra>"),
+            row=row, col=col)
+        fig.update_xaxes(title_text=label1, row=row, col=col)
+        fig.update_yaxes(title_text=label2, row=row, col=col)
 
-
-# ---------- plotting ----------
-PSI = 6894.757  # Pa per psi
-
-# Fixed categorical order (colorblind-validated reference palette): series keep their color across plots
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-SEQUENTIAL_CMAP = LinearSegmentedColormap.from_list("blues", ["#cde2fb", "#86b6ef", "#2a78d6", "#1c5cab", "#104281"])
-GUIDE_COLOR = "#8a8a86"  # reference lines (ambient, guidelines)
-plt.rcParams["axes.prop_cycle"] = plt.cycler(color=CATEGORICAL)
-plt.rcParams["lines.linewidth"] = 1.6
-
-
-def sequential_colors(n):
-    """n colors from light to dark blue, for ordered values such as a sweep (skips the palest step)."""
-    return [SEQUENTIAL_CMAP(0.3 + 0.7 * i / max(n - 1, 1)) for i in range(n)]
-
-
-def finish(fig, ax, path):
-    for a in np.ravel(ax):
-        a.grid(alpha=0.3)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=120)
-
-
-def plot_results(result, path="outputs/results.png"):
-    """Thrust, pressures, stiffness, flows, O/F and Isp vs. time; saves a PNG and returns the figure."""
-    h, s = result["history"], result["summary"]
-    t = h["t"]
-    burn = t >= STARTUP_TIME  # during the ramp Pc is near ambient, so ratios like stiffness spike meaninglessly
-
-    fig, ax = plt.subplots(2, 3, figsize=(17, 8.5), sharex=True)
-    fig.suptitle(f"{s['motor']}   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
-                 f"Isp = {s['average_Isp']:.0f} s\nstop: {s['stop_reason']}")
-
-    a = ax[0, 0]
-    a.plot(t, h["F"], label="total")
-    a.plot(t, h["F_momentum"], "--", label="momentum")
-    a.plot(t, h["F_pressure"], ":", label="pressure")
-    a.set_ylabel("Thrust [N]")
-    a.legend(loc="lower left")
-    # Zoomed inset of the startup ramp, which is too short to see on the full time axis
-    inset = a.inset_axes([0.3, 0.12, 0.33, 0.4])
-    start = t <= 5 * STARTUP_TIME
-    inset.plot(t[start] * 1000, h["F"][start], ".-", markersize=4)
-    inset.set_title("startup", fontsize=8)
-    inset.set_xlabel("ms", fontsize=8)
-    inset.tick_params(labelsize=7)
-    inset.grid(alpha=0.3)
-
-    a = ax[0, 1]
-    for name, label in [("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("P_man_ox", "ox manifold"),
-                        ("P_man_fuel", "fuel manifold"), ("Pc", "chamber")]:
-        a.plot(t, h[name] / PSI, label=label)
-    a.set_ylabel("Pressure [psi]")
-    a.legend()
-
-    a = ax[0, 2]
-    a.plot(t[burn], h["stiffness_ox"][burn] * 100, label="oxidizer")
-    a.plot(t[burn], h["stiffness_fuel"][burn] * 100, label="fuel")
-    a.axhline(30, color=GUIDE_COLOR, ls=":", label="30% guideline")
-    a.set_ylabel("Injector stiffness [%]")
-    a.legend()
-
-    a = ax[1, 0]
-    a.plot(t, h["mdot_ox"], label="oxidizer")
-    a.plot(t, h["mdot_fuel"], label="fuel")
-    a.set_ylabel("Mass flow [kg/s]")
-    a.set_xlabel("Time [s]")
-    a.legend()
-
-    a = ax[1, 1]
-    a.plot(t[burn], h["OF"][burn])
-    a.set_ylabel("O/F")
-    a.set_xlabel("Time [s]")
-
-    a = ax[1, 2]
-    a.plot(t[burn], h["Isp"][burn])
-    a.set_ylabel("Isp [s]")
-    a.set_xlabel("Time [s]")
-
-    finish(fig, ax, path)
-    return fig
-
-
-def plot_details(result, path="outputs/details.png"):
-    """Propellant left, c*, chamber temperature and nozzle exit pressure vs. time; saves a PNG."""
-    h, s = result["history"], result["summary"]
-    t = h["t"]
-    burn = t >= STARTUP_TIME
-
-    fig, ax = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
-    fig.suptitle(f"{s['motor']}: details")
-
-    a = ax[0, 0]
-    a.plot(t, h["m_ox"], label="oxidizer")
-    a.plot(t, h["m_fuel"], label="fuel")
-    a.set_ylabel("Propellant left [kg]")
-    a.legend()
-
-    a = ax[0, 1]
-    a.plot(t[burn], h["cstar"][burn])
-    a.set_ylabel("c* with efficiency [m/s]")
-
-    a = ax[1, 0]
-    a.plot(t[burn], h["Tc"][burn])
-    a.set_ylabel("Chamber temperature [K]")
-    a.set_xlabel("Time [s]")
-
-    a = ax[1, 1]
-    a.plot(t[burn], h["Pe"][burn] / PSI, label="exit pressure")
-    a.axhline(s["ambient_pressure"] / PSI, color=GUIDE_COLOR, ls="--", label="ambient")
-    a.axhline(SEPARATION_RATIO * s["ambient_pressure"] / PSI, color=GUIDE_COLOR, ls=":", label="separation risk (40% ambient)")
-    a.set_ylabel("Pressure [psi]")
-    a.set_xlabel("Time [s]")
-    a.legend()
-
-    finish(fig, ax, path)
-    return fig
+    fig.update_layout(height=1300)
+    return save_page(fig, path, f"Sweep: {s1['parameter']} × {s2['parameter']}")
 
 
 if __name__ == "__main__":
@@ -937,7 +956,7 @@ if __name__ == "__main__":
         cases = run_sweeps(inputs, sweeps)
         save_sweep_csv(sweeps, cases)
         plot_sweep(sweeps, cases)
-        print("\nSaved outputs/sweep.png and outputs/sweep_results.csv")
+        print("\nSaved outputs/sweep.html and outputs/sweep_results.csv")
     else:
         print("Running...")
         result = run(inputs)
@@ -945,7 +964,4 @@ if __name__ == "__main__":
         for name, value in result["summary"].items():
             print(f"{name:22} {value:.6g}" if isinstance(value, float) else f"{name:22} {value}")
         plot_results(result)
-        plot_details(result)
-        print("\nSaved outputs/results.png and outputs/details.png")
-
-    plt.show()
+        print("\nSaved outputs/results.html")
