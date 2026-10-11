@@ -19,6 +19,9 @@ dist/
 .idea/dataSources*
 .idea/httpRequests/
 
+# Generated plots (recreated by every run of sim.py)
+outputs/
+
 # LibreOffice / Excel lock files while a spreadsheet is open
 .~lock.*#
 ~$*
