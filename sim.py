@@ -717,10 +717,12 @@ def format_duration(seconds):
     return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
+LBF = 4.448222  # N per pound-force (thrust is shown in lbf; impulse stays in N·s for the motor class)
+
 SWEEP_METRICS = [  # (summary key, label, scale)
     ("total_impulse", "Total impulse [N·s]", 1),
-    ("average_thrust", "Average thrust [N]", 1),
-    ("peak_thrust", "Peak thrust [N]", 1),
+    ("average_thrust", "Average thrust [lbf]", 1 / LBF),
+    ("peak_thrust", "Peak thrust [lbf]", 1 / LBF),
     ("average_Isp", "Average Isp [s]", 1),
     ("burn_time", "Burn time [s]", 1),
     ("min_stiffness_ox", "Min oxidizer stiffness [%]", 100),
@@ -788,8 +790,9 @@ def sequential_colors(n):
     return colors
 
 
-def save_page(fig, path, title):
-    """Write the figure as a standalone web page (works offline) and optionally open it."""
+def save_page(fig, path, title, extra_html=""):
+    """Write the figure as a standalone web page (works offline) and optionally open it.
+    extra_html is added at the end of the page (e.g. the animation switch)."""
     s = STYLE
     fig.update_layout(title=title, template="plotly_dark" if THEME == "dark" else "plotly_white",
                       paper_bgcolor=s["surface"], plot_bgcolor=s["surface"],
@@ -801,11 +804,173 @@ def save_page(fig, path, title):
     html = fig.to_html(include_plotlyjs=True, full_html=True)
     # Match the page itself to the plot background, so there's no white border around it
     html = html.replace("<head>", f"<head><style>body {{ background: {s['surface']}; margin: 0; }}</style>", 1)
+    html = html.replace("</body>", extra_html + "</body>", 1)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     if OPEN_IN_BROWSER:
         webbrowser.open(Path(path).resolve().as_uri())
     return path
+
+
+# Animation switch for the results page. Plain JavaScript that runs in the browser: when switched on,
+# every curve draws itself out in real time, led by a bright point that leaves a fading streak, then
+# holds the finished plot briefly and loops. The @TOKENS@ are filled in from the theme.
+ANIMATION_HTML = """
+<style>
+  #anim { position: absolute; top: 46px; right: 34px; z-index: 10; display: flex; align-items: center;
+          gap: 10px; font: 13px "Open Sans", Arial, sans-serif; color: @TEXT2@; user-select: none; }
+  #anim label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  #anim input { position: absolute; opacity: 0; width: 0; height: 0; }
+  #anim .track { width: 36px; height: 20px; border-radius: 10px; background: @GRID@; position: relative;
+                 transition: background 0.15s; }
+  #anim .knob { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+                background: @TEXT@; transition: left 0.15s; }
+  #anim input:checked + .track { background: @ACCENT@; }
+  #anim input:checked + .track .knob { left: 19px; }
+  #anim input:focus-visible + .track { outline: 2px solid @ACCENT@; outline-offset: 2px; }
+  #anim-clock { font-variant-numeric: tabular-nums; min-width: 64px; color: @TEXT@; }
+</style>
+<div id="anim">
+  <span id="anim-clock"></span>
+  <label><input type="checkbox" id="anim-toggle"><span class="track"><span class="knob"></span></span>Animate</label>
+</div>
+<script>
+(function () {
+  const TRAIL = 1.0;   // seconds of streak behind the moving point
+  const HOLD = 1.2;    // seconds to hold the finished plot before looping
+  const HEAD = 6;      // size of the leading point [px]
+  const LINE = { opacity: 0.85, "line.width": 3 };   // the drawn-so-far curve while animating
+  const gd = document.querySelector(".plotly-graph-div");
+  const toggle = document.getElementById("anim-toggle");
+  const clock = document.getElementById("anim-clock");
+  let curves = null, keepers = [], tEnd = 0, running = false, start = 0;
+
+  const axisName = (id, letter) => letter + "axis" + ((id || letter).slice(1));
+
+  // Index of the last point with x <= t (x is time, increasing)
+  function lastBefore(x, t) {
+    let lo = 0, hi = x.length - 1;
+    if (t < x[0]) return -1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (x[mid] <= t) lo = mid; else hi = mid - 1; }
+    return lo;
+  }
+
+  function setup() {
+    curves = [];
+    const extents = {};
+    gd._fullData.forEach(fd => {
+      if (fd.mode !== "lines" || fd.x.length < 10) return;   // only the time-history curves
+      const c = { i: fd.index, x: Array.from(fd.x), y: Array.from(fd.y), color: fd.line.color,
+                  xa: fd.xaxis, ya: fd.yaxis };
+      curves.push(c);
+      // Track each panel's full data extent, so the axes don't rescale while the curves are partial
+      const key = c.xa + "," + c.ya;
+      const e = extents[key] || (extents[key] = { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity });
+      c.x.forEach((xv, k) => {
+        const yv = c.y[k];
+        if (!isFinite(xv) || !isFinite(yv)) return;
+        e.x0 = Math.min(e.x0, xv); e.x1 = Math.max(e.x1, xv); e.y0 = Math.min(e.y0, yv); e.y1 = Math.max(e.y1, yv);
+      });
+      tEnd = Math.max(tEnd, c.x[c.x.length - 1]);
+    });
+    // Each curve gets a streak trace on top, grouped with it so legend clicks hide both together
+    const groupUpdate = { legendgroup: curves.map(c => "anim" + c.i) };
+    Plotly.restyle(gd, groupUpdate, curves.map(c => c.i));
+    const streaks = curves.map(c => ({
+      x: [], y: [], mode: "markers", xaxis: c.xa, yaxis: c.ya, legendgroup: "anim" + c.i,
+      legend: gd._fullData[c.i].legend, showlegend: false, hoverinfo: "skip",
+      marker: { color: c.color, size: [], opacity: [], line: { width: 0 } },
+    }));
+    // Invisible corner points holding each panel's full extent (sized like the head, so it never pokes out)
+    const corners = Object.entries(extents).map(([key, e]) => {
+      const [xa, ya] = key.split(",");
+      return { x: [e.x0, e.x1], y: [e.y0, e.y1], xaxis: xa, yaxis: ya, mode: "markers", visible: false,
+               showlegend: false, hoverinfo: "skip", marker: { size: HEAD, opacity: 0 } };
+    });
+    const first = gd.data.length;
+    curves.forEach((c, k) => c.s = first + k);
+    keepers = corners.map((_, k) => first + curves.length + k);
+    Plotly.addTraces(gd, streaks.concat(corners));
+  }
+
+  // The curve up to time t, and its streak: points in the last TRAIL seconds, filled in so the
+  // streak stays continuous on steep sections, fading in size and opacity with age
+  function frameData(c, t) {
+    const k = lastBefore(c.x, t);
+    if (k < 0) return [{ x: [], y: [] }, { x: [], y: [], marker: { size: [], opacity: [] } }];
+    let xh = c.x[k], yh = c.y[k];
+    if (k < c.x.length - 1 && c.x[k + 1] > c.x[k]) {         // interpolate the head between steps
+      const f = (t - c.x[k]) / (c.x[k + 1] - c.x[k]);
+      xh = c.x[k] + f * (c.x[k + 1] - c.x[k]); yh = c.y[k] + f * (c.y[k + 1] - c.y[k]);
+    }
+    const lineX = c.x.slice(0, k + 1), lineY = c.y.slice(0, k + 1);
+    lineX.push(xh); lineY.push(yh);
+
+    const xa = gd._fullLayout[axisName(c.xa, "x")], ya = gd._fullLayout[axisName(c.ya, "y")];
+    const sx = xa._length / (xa.range[1] - xa.range[0]), sy = ya._length / (ya.range[1] - ya.range[0]);
+    let j = k;
+    while (j > 0 && c.x[j - 1] >= t - TRAIL) j--;
+    const px = c.x.slice(j, k + 1), py = c.y.slice(j, k + 1);
+    px.push(xh); py.push(yh);
+    const X = [], Y = [], S = [], O = [];
+    for (let n = 0; n < px.length; n++) {
+      const steps = n === 0 ? 1 : Math.min(40, Math.max(1, Math.ceil(Math.hypot((px[n] - px[n - 1]) * sx, (py[n] - py[n - 1]) * sy) / 2)));
+      for (let m = 1; m <= steps; m++) {
+        const f = n === 0 ? 1 : m / steps;
+        const xv = n === 0 ? px[0] : px[n - 1] + f * (px[n] - px[n - 1]);
+        const yv = n === 0 ? py[0] : py[n - 1] + f * (py[n] - py[n - 1]);
+        if (!isFinite(yv)) continue;
+        const fresh = Math.max(0, 1 - (xh - xv) / TRAIL);   // 1 at the head, 0 at the end of the streak
+        X.push(xv); Y.push(yv); S.push(2.5 + (HEAD - 2.5) * fresh); O.push(0.6 * fresh ** 2.5);
+      }
+    }
+    if (X.length) { S[S.length - 1] = HEAD; O[O.length - 1] = 1; }  // the leading point itself
+    return [{ x: lineX, y: lineY }, { x: X, y: Y, marker: { size: S, opacity: O } }];
+  }
+
+  function draw(t) {
+    const u = { x: [], y: [], "marker.size": [], "marker.opacity": [] }, traces = [];
+    curves.forEach(c => {
+      const [ln, st] = frameData(c, t);
+      u.x.push(ln.x, st.x); u.y.push(ln.y, st.y);
+      u["marker.size"].push(null, st.marker.size); u["marker.opacity"].push(null, st.marker.opacity);
+      traces.push(c.i, c.s);
+    });
+    clock.textContent = "t = " + t.toFixed(2) + " s";
+    Plotly.restyle(gd, u, traces);
+  }
+
+  function tick(now) {
+    if (!running) return;
+    draw(Math.min((Math.max(0, now - start) / 1000) % (tEnd + HOLD), tEnd));
+    requestAnimationFrame(tick);
+  }
+
+  toggle.addEventListener("change", () => {
+    if (!curves) setup();
+    running = toggle.checked;
+    if (running) {
+      Plotly.restyle(gd, LINE, curves.map(c => c.i));
+      Plotly.restyle(gd, { visible: true }, keepers);
+      start = performance.now();
+      requestAnimationFrame(tick);
+    } else {
+      // Back to the full static curves
+      Plotly.restyle(gd, { x: curves.map(c => c.x), y: curves.map(c => c.y), opacity: 1, "line.width": 2 }, curves.map(c => c.i));
+      Plotly.restyle(gd, { x: curves.map(() => []), y: curves.map(() => []) }, curves.map(c => c.s));
+      Plotly.restyle(gd, { visible: false }, keepers);
+      clock.textContent = "";
+    }
+  });
+})();
+</script>
+"""
+
+
+def animation_html():
+    s = STYLE
+    return (ANIMATION_HTML.replace("@TEXT@", s["text"]).replace("@TEXT2@", s["text_secondary"])
+            .replace("@GRID@", s["grid"]).replace("@ACCENT@", s["categorical"][0]))
 
 
 def panel_legend(fig, n, row, col, title=None, corner="right"):
@@ -835,16 +1000,16 @@ def plot_results(result, path="outputs/results.html"):
     tb = t[burn]
     blue, orange, aqua, yellow, magenta = CATEGORICAL[:5]
 
-    titles = ["Thrust [N]", "Pressure [psi]", "Injector stiffness [%]", "Mass flow [kg/s]", "O/F",
+    titles = ["Thrust [lbf]", "Pressure [psi]", "Injector stiffness [%]", "Mass flow [kg/s]", "O/F",
               "Isp [s]", "Propellant left [kg]", "c* with efficiency [m/s]", "Chamber temperature [K]",
               "Nozzle exit pressure [psi]"]
     fig = make_subplots(rows=5, cols=2, shared_xaxes=True, subplot_titles=titles,
-                        vertical_spacing=0.05, horizontal_spacing=0.08)
+                        vertical_spacing=0.07, horizontal_spacing=0.08)
 
     lg = panel_legend(fig, 1, 1, 1)
-    line(fig, 1, 1, t, h["F"], "total", blue, hover_unit="N", legend=lg)
-    line(fig, 1, 1, t, h["F_momentum"], "momentum", orange, "dash", "N", legend=lg)
-    line(fig, 1, 1, t, h["F_pressure"], "pressure", aqua, "dot", "N", legend=lg)
+    line(fig, 1, 1, t, h["F"] / LBF, "total", blue, hover_unit="lbf", legend=lg)
+    line(fig, 1, 1, t, h["F_momentum"] / LBF, "momentum", orange, "dash", "lbf", legend=lg)
+    line(fig, 1, 1, t, h["F_pressure"] / LBF, "pressure", aqua, "dot", "lbf", legend=lg)
 
     lg = panel_legend(fig, 2, 1, 2)
     for (key, name), color in zip([("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("P_man_ox", "ox manifold"),
@@ -872,12 +1037,12 @@ def plot_results(result, path="outputs/results.html"):
     fig.add_hline(y=SEPARATION_RATIO * Pa, line=dict(color=GUIDE_COLOR, dash="dot"),
                   annotation_text="separation risk", row=5, col=2)
 
-    for col in (1, 2):
-        fig.update_xaxes(title_text="Time [s]", row=5, col=col)
+    # Shared axes keep zooming in sync; show the time axis on every panel, not just the bottom row
+    fig.update_xaxes(showticklabels=True, title_text="Time [s]", title_standoff=4)
     fig.update_layout(height=1600, hovermode="x unified")
     title = (f"{s['motor']}   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
              f"Isp = {s['average_Isp']:.0f} s   (stop: {s['stop_reason']})")
-    return save_page(fig, path, title)
+    return save_page(fig, path, title, animation_html())
 
 
 def plot_sweep(sweeps, cases, path="outputs/sweep.html"):
@@ -895,14 +1060,14 @@ def _plot_sweep_1d(sweep, cases, path, max_legend=12):
     label = f"{sweep['parameter']}{unit}"
     x = [c["values"][0] for c in ok]
 
-    curves = [("F", "Thrust [N]", 1, False), ("Pc", "Chamber pressure [psi]", 1 / PSI, False),
+    curves = [("F", "Thrust [lbf]", 1 / LBF, False), ("Pc", "Chamber pressure [psi]", 1 / PSI, False),
               ("OF", "O/F", 1, True), ("stiffness_ox", "Oxidizer injector stiffness [%]", 100, True),
               ("stiffness_fuel", "Fuel injector stiffness [%]", 100, True)]
     metrics = [  # (title, [(summary key, scale, series name, color)])
         ("Total impulse [N·s]", [("total_impulse", 1, "total impulse", CATEGORICAL[0])]),
         ("Average Isp [s]", [("average_Isp", 1, "average Isp", CATEGORICAL[0])]),
-        ("Thrust [N]", [("average_thrust", 1, "average thrust", CATEGORICAL[0]),
-                        ("peak_thrust", 1, "peak thrust", CATEGORICAL[1])]),
+        ("Thrust [lbf]", [("average_thrust", 1 / LBF, "average thrust", CATEGORICAL[0]),
+                          ("peak_thrust", 1 / LBF, "peak thrust", CATEGORICAL[1])]),
         ("Burn time [s]", [("burn_time", 1, "burn time", CATEGORICAL[0])]),
         ("Minimum injector stiffness [%]", [("min_stiffness_ox", 100, "min ox stiffness", CATEGORICAL[0]),
                                             ("min_stiffness_fuel", 100, "min fuel stiffness", CATEGORICAL[1])]),
