@@ -4,10 +4,29 @@ import matplotlib.pyplot as plt                   # plotting
 import numpy as np                                # arrays and math on whole time histories
 import openpyxl                                   # reading input.xlsx
 from CoolProp.CoolProp import PropsSI             # N2O properties: PropsSI(output, in1, v1, in2, v2, "NitrousOxide")
-from rocketcea.cea_obj import CEA_Obj             # NASA CEA: c*, chamber temp, gamma, MW vs. Pc and O/F
+from rocketcea.cea_obj_w_units import CEA_Obj     # NASA CEA (SI-units version): c*, Tc, gamma, MW vs. Pc and O/F
 from scipy.optimize import brentq                 # root finding, e.g. the chamber pressure / mass flow balance
 
 INPUT_FILE = "input.xlsx"
+
+# HalfCat switches the N2O tank to gas-phase blowdown below this fraction of the starting ox mass
+GAS_PHASE_FRACTION = 0.10
+
+# CoolProp has no N2O viscosity model; approximate value for the vapor (only affects line friction)
+N2O_VAPOR_VISCOSITY = 1.5e-5  # [Pa s]
+
+# O/F is clamped to this range before calling CEA (it fails at extreme mixtures, e.g. zero fuel flow)
+OF_MIN, OF_MAX = 0.5, 10.0
+
+G0 = 9.80665  # standard gravity [m/s^2], for Isp
+
+# Rule of thumb: nozzle flow may separate from the wall when exit pressure < this fraction of ambient
+SEPARATION_RATIO = 0.4
+
+# Startup ramp (after HalfCat): flow is established before ignition, then chamber pressure rises
+# linearly from ambient to its balanced value over STARTUP_TIME, stepped at STARTUP_DT
+STARTUP_TIME = 0.010  # [s]
+STARTUP_DT = 0.001    # [s]
 
 # Column letters for each input panel on the sheet: parameter name, then (value, unit) pairs
 PANELS = [
@@ -56,11 +75,13 @@ def load_inputs(path=INPUT_FILE):
     def is_typed_number(cell_ref):
         return isinstance(ws_formulas[cell_ref].value, (int, float))
 
-    # Fuel name: the dropdown to the right of the "Fuel Properties" heading
+    # Fuel name: the dropdown to the right of the "Propellant Properties" heading
     for row in ws.iter_rows():
         for cell in row:
-            if cell.value == "Fuel Properties":
+            if cell.value == "Propellant Properties":
                 inputs["Fuel"] = ws.cell(cell.row, cell.column + 1).value
+    if "Fuel" not in inputs:
+        raise ValueError(f"No 'Propellant Properties' heading (with the fuel dropdown beside it) in {path}")
 
     # Sweep block: rows under the "Parameter | min | max | step | 0/1" header
     sweep_rows = []
@@ -114,8 +135,29 @@ def load_inputs(path=INPUT_FILE):
     return inputs, sweeps
 
 
+# math functions
+
 def area(diameter):
     return math.pi / 4 * (diameter ** 2)
+
+def bisect(func, lo, hi, tol=1.0, max_iter=100):
+    """Find x in [lo, hi] where func(x) = 0; func(lo) and func(hi) must have opposite signs."""
+    f_lo = func(lo)
+    if f_lo * func(hi) > 0:
+        raise ValueError(f"bisect: no sign change between {lo} and {hi}")
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        f_mid = func(mid)
+        if f_mid * f_lo > 0:        # same sign as the low end, so the root is in the upper half
+            lo, f_lo = mid, f_mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return (lo + hi) / 2
+
+
+# engine calcs
 
 def initial_conditions(inputs):
 
@@ -126,17 +168,18 @@ def initial_conditions(inputs):
 
     rho_ox = PropsSI("D", "T", T_ox, "Q", 0, inputs["Oxidizer"])
     V_ox = inputs["Oxidizer Length"] * tank_area
-    m_ox = rho_ox * V_ox
+    m_ox0 = rho_ox * V_ox
 
     rho_fuel = inputs["Fuel Density"]
     V_fuel = inputs["Fuel Length"] * tank_area
-    m_fuel = rho_fuel * V_fuel
+    m_fuel0 = rho_fuel * V_fuel
 
-    P_tank0 = PropsSI("P", "T", T_ox, "Q", 0, inputs["Oxidizer"])
+    P_ox0 = PropsSI("P", "T", T_ox, "Q", 0, inputs["Oxidizer"])
+    P_fuel0 = P_ox0 - inputs["Fuel Piston Loss"]
 
     A_t = area(inputs["Throat Diameter"])
     A_e = area(inputs["Exit Diameter"])
-    A_oxfeed = area(inputs["Ox Line Diameter"])
+    A_oxfeed = area(inputs["Oxidizer Line Diameter"])
     A_fuelfeed = area(inputs["Fuel Line Diameter"])
 
     CdA_ox = inputs["No. Oxidizer Holes"] * area(inputs["Oxidizer Hole Diameter"]) * inputs["Oxidizer Cd"]
@@ -148,31 +191,560 @@ def initial_conditions(inputs):
         "rho_fuel": rho_fuel,
         "V_ox": V_ox,
         "V_fuel": V_fuel,
-        "m_ox": m_ox,
-        "m_fuel": m_fuel,
-        "P_tank0": P_tank0,
+        "m_ox0": m_ox0,
+        "m_fuel0": m_fuel0,
+        "P_ox0": P_ox0,
+        "P_fuel0": P_fuel0,
         "A_t": A_t,
         "A_e": A_e,
+        "eps": A_e / A_t,  # nozzle area (expansion) ratio
         "A_oxfeed": A_oxfeed,
         "A_fuelfeed": A_fuelfeed,
         "CdA_ox": CdA_ox,
         "CdA_fuel": CdA_fuel,
     }
 
+def tank_pressures(m_ox, t, t_switch, ic, inputs):
+    """Tank pressures and N2O density for the oxidizer mass left (HalfCat's empirical blowdown).
+
+    m_ox:     oxidizer mass left now [kg]
+    t:        time now [s]
+    t_switch: time the tank switched to the gas phase [s], or None while still liquid
+    """
+    L = inputs["Decay Constant (liquid)"]
+    k = inputs["Decay Constant (vapor)"]
+    fraction_left = m_ox / ic["m_ox0"]
+
+    if fraction_left > GAS_PHASE_FRACTION:
+        # Liquid phase: straight line from P0 (full) down to L*P0 (empty)
+        phase = "liquid"
+        P_ox = ic["P_ox0"] * (fraction_left * (1 - L) + L)
+        rho_ox = PropsSI("D", "P", P_ox, "Q", 0, inputs["Oxidizer"])  # saturated liquid
+    else:
+        # Gas phase: exponential decay from the pressure where the liquid phase ended
+        phase = "gas"
+        if t_switch is None:
+            t_switch = t  # first step in the gas phase
+        P_switch = ic["P_ox0"] * (GAS_PHASE_FRACTION * (1 - L) + L)
+        P_ox = P_switch * math.exp(-k * (t - t_switch))
+        rho_ox = PropsSI("D", "P", P_ox, "Q", 1, inputs["Oxidizer"])  # saturated vapor
+
+    P_fuel = P_ox - inputs["Fuel Piston Loss"]
+
+    return {
+        "phase": phase,
+        "t_switch": t_switch,  # the loop keeps this and passes it back in next step
+        "P_ox": P_ox,
+        "P_fuel": P_fuel,
+        "rho_ox": rho_ox,
+    }
+
+
+def friction_factor(Re, rel_roughness):
+    """Darcy friction factor: laminar below Re = 2300, Haaland equation above.
+
+    rel_roughness: line roughness / line diameter
+    """
+    if Re < 2300:
+        return 64 / Re
+    return (-1.8 * math.log10((rel_roughness / 3.7) ** 1.11 + 6.9 / Re)) ** -2
+
+
+def fuel_flow(P_fuel, Pc, ic, inputs):
+    """Fuel mass flow [kg/s] from the fuel tank to the chamber (single-phase incompressible).
+
+    Line + fittings and the injector are resistances in series:
+        P_fuel - Pc = mdot^2 / (2 rho) * (R_feed + R_inj)
+    """
+    if P_fuel <= Pc:
+        return 0.0  # no pressure drop, no flow
+
+    rho = ic["rho_fuel"]
+    D = inputs["Fuel Line Diameter"]
+    L = inputs["Fuel Line Length"]
+    A_line = ic["A_fuelfeed"]
+    R_inj = 1 / ic["CdA_fuel"] ** 2
+
+    f = 0.02  # starting guess; refined below from the Reynolds number
+    for _ in range(5):
+        R_feed = (f * L / D + inputs["Fuel Sum K"]) / A_line ** 2
+        mdot = math.sqrt(2 * rho * (P_fuel - Pc) / (R_feed + R_inj))
+        Re = 4 * mdot / (math.pi * D * inputs["Fuel Dynamic Viscosity"])
+        f = friction_factor(Re, inputs["Fuel Line Roughness"] / D)
+
+    return mdot
+
+
+def ox_upstream(P_ox, inputs, phase="liquid", n_grid=60):
+    """Tank-side N2O state for the current tank pressure and phase ("liquid" or "gas").
+
+    Called once per time step: everything here depends only on tank pressure, so the
+    bisections inside ox_flow can reuse it instead of calling CoolProp thousands of times.
+    Liquid: saturated liquid plus the HEM flux curve for the NHNE injector model.
+    Gas: saturated vapor plus its isentropic exponent for compressible injector flow.
+    """
+    ox = inputs["Oxidizer"]
+
+    if phase == "gas":
+        rho_v = PropsSI("D", "P", P_ox, "Q", 1, ox)
+        a = PropsSI("A", "P", P_ox, "Q", 1, ox)  # speed of sound
+        return {
+            "phase": "gas",
+            "T1": PropsSI("T", "P", P_ox, "Q", 1, ox),
+            "rho1": rho_v,
+            "mu1": N2O_VAPOR_VISCOSITY,
+            "P_tank": P_ox,
+            # Isentropic exponent from the speed of sound, k = rho a^2 / P. Saturated N2O vapor is far
+            # from ideal (cp/cv ~1.9 vs k ~1.2), and this k keeps ideal-gas nozzle formulas within ~5%
+            # of a full real-gas calculation.
+            "k": rho_v * a ** 2 / P_ox,
+        }
+
+    # Saturated liquid leaving the tank (Q = 0)
+    T1 = PropsSI("T", "P", P_ox, "Q", 0, ox)
+    rho_l = PropsSI("D", "P", P_ox, "Q", 0, ox)
+    h1 = PropsSI("H", "P", P_ox, "Q", 0, ox)
+    s1 = PropsSI("S", "P", P_ox, "Q", 0, ox)
+
+    # HEM: expand at constant entropy from (h1, s1) down to each downstream pressure P2;
+    # the enthalpy drop becomes velocity, v = sqrt(2 * (h1 - h2)), and flux = rho2 * v
+    P_grid = np.linspace(inputs["Ambient Pressure"], P_ox, n_grid)
+    h2 = PropsSI("H", "P", P_grid, "S", s1, ox)
+    rho2 = PropsSI("D", "P", P_grid, "S", s1, ox)
+    G = rho2 * np.sqrt(np.maximum(2 * (h1 - h2), 0))  # max(..., 0) guards rounding at P2 = P_ox
+
+    # The liquid is assumed to stay liquid through the feed line ("frozen"): friction drops its
+    # pressure but keeps h1 and s1, so this curve applies at the manifold too. Choking (taking the
+    # max of the curve between Pc and the manifold pressure) happens in nhne_flux, where P_man is known.
+
+    return {
+        "phase": "liquid",
+        "T1": T1,
+        "rho1": rho_l,
+        "mu1": inputs["Oxidizer Dynamic Viscosity"],  # CoolProp has no N2O viscosity model
+        "h1": h1,
+        "s1": s1,
+        "P_v": P_ox,  # saturated tank: vapor pressure = tank pressure
+        "P_grid": P_grid,
+        "G_hem": G,  # raw (unchoked) HEM flux at each pressure in P_grid
+    }
+
+
+def nhne_flux(P1, P2, up):
+    """NHNE (Dyer) mass flux, G [kg/m^2/s] through the injector from manifold P1 to chamber P2.
+
+    up: tank-side N2O state from ox_upstream. Multiply the result by CdA to get mass flow.
+    """
+    if P1 <= P2:
+        return 0.0  # no forward pressure drop, no flow
+
+    # SPI: liquid stays liquid through the hole (upper limit)
+    G_spi = math.sqrt(2 * up["rho1"] * (P1 - P2))
+
+    # HEM: liquid boils instantly (lower limit), choked: the largest flux on the curve between
+    # the chamber and the manifold, checking both ends and every grid point in between
+    P_grid, G_curve = up["P_grid"], up["G_hem"]
+    inside = (P_grid > P2) & (P_grid < P1)
+    G_hem = max(np.interp(P2, P_grid, G_curve),
+                np.interp(P1, P_grid, G_curve),
+                G_curve[inside].max(initial=0))
+
+    # K (Dyer's kappa): bubble growth time vs. time in the hole; large -> SPI-like, small -> HEM-like
+    K = math.sqrt((P1 - P2) / (up["P_v"] - P2))
+
+    # Blend: weights add to 1, so the result always lies between HEM and SPI
+    return K / (1 + K) * G_spi + 1 / (1 + K) * G_hem
+
+
+def gas_flux(P1, P2, up):
+    """Mass flux, G [kg/m^2/s] of N2O vapor through the injector from manifold P1 to chamber P2.
+
+    Compressible (ideal-gas) orifice flow using the real-gas exponent k: choked or subsonic.
+    """
+    if P1 <= P2:
+        return 0.0
+
+    k = up["k"]
+    rho_in = up["rho1"] * P1 / up["P_tank"]  # throttled through the line at ~constant T: density ~ pressure
+    r = P2 / P1
+    r_choke = (2 / (k + 1)) ** (k / (k - 1))  # below this pressure ratio the hole is choked
+    if r <= r_choke:
+        return math.sqrt(k * P1 * rho_in * (2 / (k + 1)) ** ((k + 1) / (k - 1)))
+    return math.sqrt(2 * rho_in * P1 * k / (k - 1) * (r ** (2 / k) - r ** ((k + 1) / k)))
+
+               
+def ox_flow(P_ox, Pc, up, ic, inputs):
+    """Ox mass flow [kg/s] and manifold pressure [Pa] from the ox tank to the chamber.
+
+    Feed line (friction + fittings) in series with the injector: NHNE while the tank holds
+    liquid, compressible gas flow once it's vapor. Neither scales as mdot^2, so instead of a
+    closed form, bisect on the manifold pressure P_man until the line delivers exactly what
+    the injector passes.
+    up: tank-side N2O state from ox_upstream (computed once per time step).
+    """
+    if P_ox <= Pc:
+        return {"mdot": 0.0, "P_man": P_ox}  # no pressure drop, no flow
+
+    injector_flux = nhne_flux if up["phase"] == "liquid" else gas_flux
+    rho = up["rho1"]
+    mu = up["mu1"]
+    D = inputs["Oxidizer Line Diameter"]
+    L = inputs["Oxidizer Line Length"]
+    rel_roughness = inputs["Oxidizer Line Roughness"] / D
+    A_line = ic["A_oxfeed"]
+    CdA = ic["CdA_ox"]
+
+    f = 0.02  # starting guess; refined below from the Reynolds number
+    for _ in range(3):
+        R_feed = (f * L / D + inputs["Oxidizer Sum K"]) / A_line ** 2
+
+        def mismatch(P_man):
+            """Feed line flow minus injector flow, for a guessed manifold pressure."""
+            line = math.sqrt(2 * rho * (P_ox - P_man) / R_feed)
+            injector = CdA * injector_flux(P_man, Pc, up)
+            return line - injector
+
+        # At P_man = Pc the line flows most and the injector 0 (positive); at P_man = P_ox
+        # the line flows 0 and the injector flows (negative), so the root is in between
+        P_man = bisect(mismatch, Pc, P_ox)
+        mdot = CdA * injector_flux(P_man, Pc, up)
+
+        Re = 4 * mdot / (math.pi * D * mu)
+        f = friction_factor(Re, rel_roughness)
+
+    return {"mdot": mdot, "P_man": P_man}
+
+
+def make_cea(inputs):
+    """Create the CEA object once per run, in SI units (Pa in; m/s and K out)."""
+    return CEA_Obj(oxName=inputs["Oxidizer"], fuelName=inputs["Fuel"],
+                   pressure_units="Pa", cstar_units="m/s", temperature_units="K", isp_units="sec")
+
+
+def combustion(Pc, OF, cea, ic, inputs):
+    """Hot-gas properties in the chamber for chamber pressure Pc [Pa] and mixture ratio OF.
+
+    CEA gives ideal (complete combustion) values; the c* efficiency scales c* by eta and
+    chamber temperature by eta^2, which keeps them consistent since c* ~ sqrt(R * Tc).
+    """
+    OF = min(max(OF, OF_MIN), OF_MAX)
+    _, cstar, Tc, MW, gamma = cea.get_IvacCstrTc_ChmMwGam(Pc=Pc, MR=OF, eps=ic["eps"])
+
+    eta = inputs["C* Efficiency"]  
+    return {
+        "cstar": eta * cstar,        # [m/s]
+        "Tc": eta ** 2 * Tc,         # [K]
+        "MW": MW,                    # [kg/kmol]
+        "gamma": gamma,              # chamber value
+        "R": 8314.46 / MW,           # specific gas constant [J/(kg K)]
+    }
+
+
+def chamber_state(Pc, P_ox, P_fuel, up, cea, ic, inputs):
+    """Injector flows, O/F, gas properties and nozzle flow at a given chamber pressure Pc.
+
+    At the balanced Pc (from chamber_balance), injector flow in equals nozzle flow out.
+    During the startup ramp Pc is held below that, so more flows in than out (the chamber filling).
+    """
+    ox = ox_flow(P_ox, Pc, up, ic, inputs)
+    m_fuel = fuel_flow(P_fuel, Pc, ic, inputs)
+    OF = ox["mdot"] / m_fuel if m_fuel > 0 else OF_MAX  # no fuel flow: let combustion clamp it
+    gas = combustion(Pc, OF, cea, ic, inputs)
+    P_man_fuel = Pc + m_fuel ** 2 / (2 * ic["rho_fuel"] * ic["CdA_fuel"] ** 2)  # injector's share of the drop
+
+    return {
+        "Pc": Pc,
+        "mdot_ox": ox["mdot"],
+        "mdot_fuel": m_fuel,
+        "mdot": ox["mdot"] + m_fuel,                 # injector flow in
+        "mdot_nozzle": Pc * ic["A_t"] / gas["cstar"],  # nozzle flow out (c* = Pc * At / mdot, rearranged)
+        "OF": OF,
+        "P_man_ox": ox["P_man"],
+        "P_man_fuel": P_man_fuel,
+        "stiffness_ox": (ox["P_man"] - Pc) / Pc,
+        "stiffness_fuel": (P_man_fuel - Pc) / Pc,
+        **gas,  # cstar, Tc, MW, gamma, R
+    }
+
+
+def chamber_balance(P_ox, P_fuel, up, cea, ic, inputs, tol=100.0):
+    """Chamber pressure where injector flow in equals nozzle flow out, plus everything at that point.
+
+    P_ox, P_fuel: tank pressures this step [Pa]; up: from ox_upstream (once per step);
+    cea: from make_cea (once per run); tol: bisection tolerance on Pc [Pa].
+    """
+    def mismatch(Pc):
+        """Injector flow in minus nozzle flow out."""
+        cs = chamber_state(Pc, P_ox, P_fuel, up, cea, ic, inputs)
+        return cs["mdot"] - cs["mdot_nozzle"]
+
+    # At ambient the injectors flow most and the nozzle almost nothing (positive); at the fuel
+    # tank pressure fuel stops and the nozzle flow is large (negative), so Pc lies in between
+    Pc = bisect(mismatch, inputs["Ambient Pressure"], P_fuel, tol=tol)
+    return chamber_state(Pc, P_ox, P_fuel, up, cea, ic, inputs)
+
+
+def area_ratio(M, gamma):
+    """Isentropic area ratio A/A_throat at Mach M (throat choked at Mach 1)."""
+    return (1 / M) * ((2 / (gamma + 1)) * (1 + (gamma - 1) / 2 * M ** 2)) ** ((gamma + 1) / (2 * (gamma - 1)))
+
+
+def nozzle(cb, ic, inputs):
+    """Exit-plane conditions and thrust for the chamber state cb (from chamber_balance).
+
+    Isentropic expansion with a choked throat and the flow attached to the wall; the
+    separation flag marks when that last assumption becomes doubtful.
+    """
+    gamma, Pc = cb["gamma"], cb["Pc"]
+    Pa = inputs["Ambient Pressure"]
+
+    # Exit Mach: the area-Mach relation can't be solved for M, so bisect on it. Searching
+    # from Mach 1 up picks the supersonic solution (each area ratio also has a subsonic one).
+    Me = bisect(lambda M: area_ratio(M, gamma) - ic["eps"], 1.0, 10.0, tol=1e-6)
+
+    # Isentropic relations: the gas cools and loses pressure as it speeds up
+    temp_ratio = 1 + (gamma - 1) / 2 * Me ** 2
+    Pe = Pc * temp_ratio ** (-gamma / (gamma - 1))
+    Te = cb["Tc"] / temp_ratio
+
+    # Exhaust velocity = Mach * local speed of sound, less nozzle losses
+    ve = inputs["Nozzle Efficiency"] * Me * math.sqrt(gamma * cb["R"] * Te)
+
+    # Thrust: momentum of the gas leaving the nozzle (with conical divergence loss) + pressure
+    # on the exit area. Uses nozzle flow, so during the startup ramp thrust rises with Pc.
+    # Floored at 0: at very low Pc the nozzle isn't flowing properly and the formula goes negative.
+    divergence = (1 + math.cos(inputs["Exit Half Angle"])) / 2
+    F_momentum = divergence * cb["mdot_nozzle"] * ve
+    F_pressure = (Pe - Pa) * ic["A_e"]
+    F = max(F_momentum + F_pressure, 0.0)
+
+    return {
+        "Me": Me,
+        "Pe": Pe,
+        "Te": Te,
+        "ve": ve,
+        "F_momentum": F_momentum,
+        "F_pressure": F_pressure,
+        "F": F,
+        "Isp": F / (cb["mdot_nozzle"] * G0) if cb["mdot_nozzle"] > 0 else 0.0,
+        "separation_risk": bool(Pe < SEPARATION_RATIO * Pa),  # bool(): CEA's numpy values give numpy booleans
+    }
+
+
+def motor_class(total_impulse):
+    """Motor impulse class letter: A = 1.26-2.5 N*s, and each later letter doubles the range."""
+    if total_impulse <= 2.5:
+        return "A"
+    return chr(ord("A") + math.ceil(math.log2(total_impulse / 2.5)))
+
+
+def run(inputs, progress_every=100):
+    """Simulate one burn. Returns {"history": arrays vs. time, "summary": totals and stop reason}."""
+    ic = initial_conditions(inputs)
+    cea = make_cea(inputs)
+    dt = inputs["Timestep"]
+    t_end = inputs["Sim Duration"]
+    Pa = inputs["Ambient Pressure"]
+
+    # State: the only quantities carried from one step to the next
+    t = 0.0
+    m_ox = ic["m_ox0"]
+    m_fuel = ic["m_fuel0"]
+    t_switch = None
+
+    history = {}  # name -> list of values, one per step
+    stop_reason = "sim duration reached"
+    step = 0
+
+    while t < t_end:
+        tp = tank_pressures(m_ox, t, t_switch, ic, inputs)
+        t_switch = tp["t_switch"]
+
+        # Stop checks, before any physics that would fail in these conditions
+        if m_ox <= 0:
+            stop_reason = "oxidizer depleted"
+            break
+        if m_fuel <= 0:
+            stop_reason = "fuel depleted"
+            break
+        if tp["P_fuel"] <= Pa:
+            stop_reason = "fuel tank pressure at or below ambient"
+            break
+
+        # Physics for this instant, all from the current state
+        up = ox_upstream(tp["P_ox"], inputs, tp["phase"])
+        cb = chamber_balance(tp["P_ox"], tp["P_fuel"], up, cea, ic, inputs)
+        if t < STARTUP_TIME:
+            # Startup ramp: hold Pc between ambient and its balanced value, then re-evaluate there
+            ramp = t / STARTUP_TIME
+            cb = chamber_state(Pa + ramp * (cb["Pc"] - Pa), tp["P_ox"], tp["P_fuel"], up, cea, ic, inputs)
+            step_dt = STARTUP_DT
+        else:
+            step_dt = dt
+        nz = nozzle(cb, ic, inputs)
+
+        # Record everything at time t
+        record = {"t": t, "dt": step_dt, "m_ox": m_ox, "m_fuel": m_fuel,
+                  "P_ox": tp["P_ox"], "P_fuel": tp["P_fuel"], **cb, **nz}
+        for name, value in record.items():
+            history.setdefault(name, []).append(value)
+
+        # Step the state forward (Euler): drain the tanks at this instant's injector flow rates
+        m_ox = max(m_ox - cb["mdot_ox"] * step_dt, 0.0)
+        m_fuel = max(m_fuel - cb["mdot_fuel"] * step_dt, 0.0)
+        t += step_dt
+
+        step += 1
+        if progress_every and step % progress_every == 0:
+            print(f"  t = {t:6.2f} s   F = {nz['F']:7.1f} N   Pc = {cb['Pc'] / 6894.757:5.1f} psi   "
+                  f"ox left = {m_ox / ic['m_ox0']:5.1%}")
+
+    history = {name: np.array(values) for name, values in history.items()}
+
+    # Summary (each step's thrust acts for that step's dt, matching the Euler update)
+    F = history.get("F", np.array([]))
+    burn_time = float(np.sum(history["dt"])) if len(F) else 0.0
+    total_impulse = float(np.sum(F * history["dt"])) if len(F) else 0.0
+    prop_used = (ic["m_ox0"] - m_ox) + (ic["m_fuel0"] - m_fuel)
+    summary = {
+        "stop_reason": stop_reason,
+        "ambient_pressure": Pa,
+        "burn_time": burn_time,
+        "total_impulse": total_impulse,
+        "average_thrust": total_impulse / burn_time if burn_time > 0 else 0.0,
+        "peak_thrust": float(F.max()) if len(F) else 0.0,
+        "average_Isp": total_impulse / (prop_used * G0) if prop_used > 0 else 0.0,
+        "ox_used": ic["m_ox0"] - m_ox,
+        "fuel_used": ic["m_fuel0"] - m_fuel,
+        "ox_left": m_ox,
+        "fuel_left": m_fuel,
+        "min_stiffness_ox": float(history["stiffness_ox"].min()) if len(F) else 0.0,
+        "min_stiffness_fuel": float(history["stiffness_fuel"].min()) if len(F) else 0.0,
+        # after the startup ramp (low Pc during the ramp always trips it)
+        "separation_risk_any": bool(history["separation_risk"][history["t"] >= STARTUP_TIME].any()) if len(F) else False,
+    }
+    summary["motor"] = f"{motor_class(total_impulse)}{summary['average_thrust']:.0f}"
+
+    return {"history": history, "summary": summary}
+
+
+def plot_results(result, path="outputs/results.png"):
+    """Thrust, pressures, flows/O/F and injector stiffness vs. time; saves a PNG and returns the figure."""
+    h, s = result["history"], result["summary"]
+    psi = 6894.757
+    t = h["t"]
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    fig.suptitle(f"{s['motor']}   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
+                 f"Isp = {s['average_Isp']:.0f} s\nstop: {s['stop_reason']}")
+
+    a = ax[0, 0]
+    a.plot(t, h["F"], label="total")
+    a.plot(t, h["F_momentum"], "--", label="momentum")
+    a.plot(t, h["F_pressure"], ":", label="pressure")
+    a.set_ylabel("Thrust [N]")
+    a.legend(loc="lower left")
+
+    # Zoomed inset of the startup ramp, which is too short to see on the full time axis
+    inset = a.inset_axes([0.3, 0.12, 0.33, 0.4])
+    start = t <= 5 * STARTUP_TIME
+    inset.plot(t[start] * 1000, h["F"][start], ".-")
+    inset.set_title("startup", fontsize=8)
+    inset.set_xlabel("ms", fontsize=8)
+    inset.tick_params(labelsize=7)
+    inset.grid(alpha=0.3)
+
+    a = ax[0, 1]
+    for name, label in [("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("P_man_ox", "ox manifold"),
+                        ("P_man_fuel", "fuel manifold"), ("Pc", "chamber")]:
+        a.plot(t, h[name] / psi, label=label)
+    a.set_ylabel("Pressure [psi]")
+    a.legend()
+
+    a = ax[1, 0]
+    a.plot(t, h["mdot_ox"], label="oxidizer")
+    a.plot(t, h["mdot_fuel"], label="fuel")
+    a.set_ylabel("Mass flow [kg/s]")
+    a.set_xlabel("Time [s]")
+    a.legend(loc="upper left")
+    a2 = a.twinx()
+    a2.plot(t, h["OF"], "k--", label="O/F")
+    a2.set_ylabel("O/F")
+    a2.legend(loc="upper right")
+
+    a = ax[1, 1]
+    burn = t >= STARTUP_TIME  # during the ramp Pc is near ambient, so stiffness spikes meaninglessly
+    a.plot(t[burn], h["stiffness_ox"][burn] * 100, label="oxidizer")
+    a.plot(t[burn], h["stiffness_fuel"][burn] * 100, label="fuel")
+    a.axhline(30, color="gray", ls=":", label="30% guideline")
+    a.set_ylabel("Injector stiffness [%]")
+    a.set_xlabel("Time [s]")
+    a.legend()
+
+    for a in ax.flat:
+        a.grid(alpha=0.3)
+    fig.tight_layout()
+
+    import os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=120)
+    return fig
+
+
+def plot_details(result, path="outputs/details.png"):
+    """Propellant left, combustion properties, Isp and nozzle exit pressure vs. time; saves a PNG."""
+    h, s = result["history"], result["summary"]
+    psi = 6894.757
+    t = h["t"]
+    burn = t >= STARTUP_TIME  # skip the startup ramp, where near-ambient Pc distorts these
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    fig.suptitle(f"{s['motor']}: details")
+
+    a = ax[0, 0]
+    a.plot(t, h["m_ox"], label="oxidizer")
+    a.plot(t, h["m_fuel"], label="fuel")
+    a.set_ylabel("Propellant left [kg]")
+    a.legend()
+
+    a = ax[0, 1]
+    a.plot(t[burn], h["cstar"][burn], label="c* (with efficiency)")
+    a.set_ylabel("c* [m/s]")
+    a.legend(loc="lower left")
+    a2 = a.twinx()
+    a2.plot(t[burn], h["Tc"][burn], "r--", label="chamber temperature")
+    a2.set_ylabel("Tc [K]")
+    a2.legend(loc="upper right")
+
+    a = ax[1, 0]
+    a.plot(t[burn], h["Isp"][burn])
+    a.set_ylabel("Isp [s]")
+    a.set_xlabel("Time [s]")
+
+    a = ax[1, 1]
+    a.plot(t[burn], h["Pe"][burn] / psi, label="exit pressure")
+    a.axhline(s["ambient_pressure"] / psi, color="k", ls="--", label="ambient")
+    a.axhline(SEPARATION_RATIO * s["ambient_pressure"] / psi, color="r", ls=":", label="separation risk")
+    a.set_ylabel("Pressure [psi]")
+    a.set_xlabel("Time [s]")
+    a.legend()
+
+    for a in ax.flat:
+        a.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    return fig
+
 
 if __name__ == "__main__":
     inputs, sweeps = load_inputs()
-    for name, value in inputs.items():
-        print(f"{name:28} {value:.6g}" if isinstance(value, float) else f"{name:28} {value}")
+    print("Running...")
+    result = run(inputs)
 
     print()
-    for sweep in sweeps:
-        print(f"Sweep {sweep['parameter']}: {len(sweep['values'])} values, "
-              f"{sweep['values'][0]:.6g} to {sweep['values'][-1]:.6g} (SI)")
-    if not sweeps:
-        print("No sweeps active")
+    for name, value in result["summary"].items():
+        print(f"{name:22} {value:.6g}" if isinstance(value, float) else f"{name:22} {value}")
 
-    ic = initial_conditions(inputs)
-    print()
-    for name, value in ic.items():
-        print(f"{name:28} {value:.6g}")
+    plot_results(result)
+    plot_details(result)
+    plt.show()
