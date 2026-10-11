@@ -11,7 +11,7 @@ combustion and vapor phase in more detail.
 
 ## Quick start
 
-Requires Python 3.12+ (developed on 3.14).
+Requires Python 3.10+ (developed on 3.14; tested on 3.10 and 3.14 with identical results).
 
 ```bash
 pip install -r requirements.txt
