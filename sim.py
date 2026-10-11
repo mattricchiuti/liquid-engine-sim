@@ -747,15 +747,36 @@ def save_sweep_csv(sweeps, cases, path="outputs/sweep_results.csv"):
 # ---------- plotting (interactive web pages: hover for values, drag to zoom, double-click to reset) ----------
 PSI = 6894.757  # Pa per psi
 
-# Fixed categorical order (colorblind-validated reference palette): series keep their color across plots
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-SEQUENTIAL = ["#cde2fb", "#86b6ef", "#2a78d6", "#1c5cab", "#104281"]  # light -> dark blue, for ordered values
-GUIDE_COLOR = "#8a8a86"  # reference lines (ambient, guidelines)
+THEME = "dark"          # "dark" or "light"
 OPEN_IN_BROWSER = True   # open each page when it's written
+
+# Colorblind-validated reference palette, stepped separately for each background.
+# categorical: fixed order, so series keep their color across plots.
+# sequential: for ordered values (sweep cases, heat maps), from "low" (recedes into the
+#   background) to "high" (stands out): light -> dark blue on light, dark -> light blue on dark.
+THEMES = {
+    "light": dict(
+        surface="#fcfcfb", text="#0b0b0b", text_secondary="#52514e", grid="#e6e5e1", guide="#8a8a86",
+        categorical=["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
+        sequential=["#cde2fb", "#86b6ef", "#2a78d6", "#1c5cab", "#104281"],
+        legend_bg="rgba(252,252,251,0.85)",
+    ),
+    "dark": dict(
+        surface="#1a1a19", text="#f0efec", text_secondary="#c3c2b7", grid="#383835", guide="#8a8a86",
+        categorical=["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
+        sequential=["#0d366b", "#184f95", "#2a78d6", "#86b6ef", "#cde2fb"],
+        legend_bg="rgba(26,26,25,0.85)",
+    ),
+}
+STYLE = THEMES[THEME]
+CATEGORICAL = STYLE["categorical"]
+SEQUENTIAL = STYLE["sequential"]
+GUIDE_COLOR = STYLE["guide"]  # reference lines (ambient, guidelines)
 
 
 def sequential_colors(n):
-    """n colors from light to dark blue, for ordered values such as a sweep (skips the palest step)."""
+    """n colors along the sequential ramp, for ordered values such as a sweep (skips the step that
+    would blend into the background)."""
     stops = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in SEQUENTIAL]
     colors = []
     for k in range(n):
@@ -769,10 +790,19 @@ def sequential_colors(n):
 
 def save_page(fig, path, title):
     """Write the figure as a standalone web page (works offline) and optionally open it."""
-    fig.update_layout(title=title, template="plotly_white", font=dict(size=12),
-                      margin=dict(l=60, r=30, t=90, b=40))
+    s = STYLE
+    fig.update_layout(title=title, template="plotly_dark" if THEME == "dark" else "plotly_white",
+                      paper_bgcolor=s["surface"], plot_bgcolor=s["surface"],
+                      font=dict(size=12, color=s["text"]), margin=dict(l=60, r=30, t=90, b=40))
+    fig.update_xaxes(gridcolor=s["grid"], zerolinecolor=s["grid"], linecolor=s["grid"])
+    fig.update_yaxes(gridcolor=s["grid"], zerolinecolor=s["grid"], linecolor=s["grid"])
+    fig.update_annotations(font_color=s["text_secondary"])  # subplot titles and reference-line labels
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.write_html(path, include_plotlyjs=True)
+    html = fig.to_html(include_plotlyjs=True, full_html=True)
+    # Match the page itself to the plot background, so there's no white border around it
+    html = html.replace("<head>", f"<head><style>body {{ background: {s['surface']}; margin: 0; }}</style>", 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
     if OPEN_IN_BROWSER:
         webbrowser.open(Path(path).resolve().as_uri())
     return path
@@ -785,7 +815,7 @@ def panel_legend(fig, n, row, col, title=None, corner="right"):
     sp = fig.get_subplot(row, col)
     x = sp.xaxis.domain[1] if corner == "right" else sp.xaxis.domain[0] + 0.01
     fig.update_layout(**{lid: dict(x=x, y=sp.yaxis.domain[1], xanchor=corner, yanchor="top",
-                                   bgcolor="rgba(255,255,255,0.8)", font=dict(size=10),
+                                   bgcolor=STYLE["legend_bg"], font=dict(size=10),
                                    title=dict(text=title) if title else None)})
     return lid
 
