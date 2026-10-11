@@ -22,6 +22,11 @@ N2O_VAPOR_VISCOSITY = 1.5e-5  # [Pa s]
 # O/F is clamped to this range before calling CEA (it fails at extreme mixtures, e.g. zero fuel flow)
 OF_MIN, OF_MAX = 0.5, 10.0
 
+# CEA lookup table grid: chamber pressure spaced evenly in ln(Pc) (properties vary slowly with Pc);
+# O/F finer below 2, where properties change fastest (fuel-rich tail)
+CEA_PC_GRID = np.geomspace(5e4, 8e6, 20)  # [Pa]
+CEA_OF_GRID = np.concatenate([np.arange(OF_MIN, 2.0, 0.05), np.arange(2.0, OF_MAX + 1e-9, 0.1)])
+
 G0 = 9.80665  # standard gravity [m/s^2], for Isp
 
 # Rule of thumb: nozzle flow may separate from the wall when exit pressure < this fraction of ambient
@@ -326,6 +331,8 @@ def ox_upstream(P_ox, inputs, phase="liquid", n_grid=60):
     # The liquid is assumed to stay liquid through the feed line ("frozen"): friction drops its
     # pressure but keeps h1 and s1, so this curve applies at the manifold too. Choking (taking the
     # max of the curve between Pc and the manifold pressure) happens in nhne_flux, where P_man is known.
+    # The curve has a single hump, so that max is either the peak or one of the two ends: store the peak.
+    i_peak = int(np.argmax(G))
 
     return {
         "phase": "liquid",
@@ -337,6 +344,8 @@ def ox_upstream(P_ox, inputs, phase="liquid", n_grid=60):
         "P_v": P_ox,  # saturated tank: vapor pressure = tank pressure
         "P_grid": P_grid,
         "G_hem": G,  # raw (unchoked) HEM flux at each pressure in P_grid
+        "P_peak": P_grid[i_peak],  # where the HEM flux peaks (chokes)
+        "G_peak": G[i_peak],
     }
 
 
@@ -352,12 +361,12 @@ def nhne_flux(P1, P2, up):
     G_spi = math.sqrt(2 * up["rho1"] * (P1 - P2))
 
     # HEM: liquid boils instantly (lower limit), choked: the largest flux on the curve between
-    # the chamber and the manifold, checking both ends and every grid point in between
-    P_grid, G_curve = up["P_grid"], up["G_hem"]
-    inside = (P_grid > P2) & (P_grid < P1)
-    G_hem = max(np.interp(P2, P_grid, G_curve),
-                np.interp(P1, P_grid, G_curve),
-                G_curve[inside].max(initial=0))
+    # the chamber and the manifold. The curve has one hump, so that's the peak if it lies in
+    # between (choked), otherwise the larger of the two ends.
+    if P2 <= up["P_peak"] <= P1:
+        G_hem = up["G_peak"]
+    else:
+        G_hem = max(np.interp(P2, up["P_grid"], up["G_hem"]), np.interp(P1, up["P_grid"], up["G_hem"]))
 
     # K (Dyer's kappa): bubble growth time vs. time in the hole; large -> SPI-like, small -> HEM-like
     K = math.sqrt((P1 - P2) / (up["P_v"] - P2))
@@ -405,7 +414,7 @@ def ox_flow(P_ox, Pc, up, ic, inputs):
     CdA = ic["CdA_ox"]
 
     f = 0.02  # starting guess; refined below from the Reynolds number
-    for _ in range(3):
+    for _ in range(2):  # f settles after one update (N2O's high Reynolds number)
         R_feed = (f * L / D + inputs["Oxidizer Sum K"]) / A_line ** 2
 
         def mismatch(P_man):
@@ -416,7 +425,7 @@ def ox_flow(P_ox, Pc, up, ic, inputs):
 
         # At P_man = Pc the line flows most and the injector 0 (positive); at P_man = P_ox
         # the line flows 0 and the injector flows (negative), so the root is in between
-        P_man = bisect(mismatch, Pc, P_ox)
+        P_man = bisect(mismatch, Pc, P_ox, tol=10.0)
         mdot = CdA * injector_flux(P_man, Pc, up)
 
         Re = 4 * mdot / (math.pi * D * mu)
@@ -425,22 +434,47 @@ def ox_flow(P_ox, Pc, up, ic, inputs):
     return {"mdot": mdot, "P_man": P_man}
 
 
-def make_cea(inputs):
-    """Create the CEA object once per run, in SI units (Pa in; m/s and K out)."""
-    return CEA_Obj(oxName=inputs["Oxidizer"], fuelName=inputs["Fuel"],
-                   pressure_units="Pa", cstar_units="m/s", temperature_units="K", isp_units="sec")
+_CEA_TABLES = {}  # built tables, by (oxidizer, fuel), reused across runs (e.g. every case of a sweep)
 
 
-def combustion(Pc, OF, cea, ic, inputs):
+def cea_table(inputs):
+    """Table of ideal chamber properties (c*, Tc, MW, gamma) over a grid of Pc and O/F, from NASA CEA.
+
+    Built once per propellant pair (~1 s) and reused; combustion() interpolates in it, which is
+    ~40x faster than calling CEA directly. Chamber properties don't depend on the nozzle, so the
+    table doesn't either.
+    """
+    key = (inputs["Oxidizer"], inputs["Fuel"])
+    if key not in _CEA_TABLES:
+        cea = CEA_Obj(oxName=key[0], fuelName=key[1], pressure_units="Pa", cstar_units="m/s",
+                      temperature_units="K", isp_units="sec")
+        lnP = np.log(CEA_PC_GRID)
+        values = np.array([[cea.get_IvacCstrTc_ChmMwGam(Pc=Pc, MR=OF, eps=4.0)[1:]  # eps doesn't affect these
+                            for OF in CEA_OF_GRID] for Pc in CEA_PC_GRID])          # shape (nPc, nOF, 4)
+        _CEA_TABLES[key] = {"lnP": lnP, "OF": CEA_OF_GRID, "values": values}
+    return _CEA_TABLES[key]
+
+
+def combustion(Pc, OF, table, inputs):
     """Hot-gas properties in the chamber for chamber pressure Pc [Pa] and mixture ratio OF.
 
-    CEA gives ideal (complete combustion) values; the c* efficiency scales c* by eta and
-    chamber temperature by eta^2, which keeps them consistent since c* ~ sqrt(R * Tc).
+    Interpolates the CEA table (bilinear in ln(Pc) and O/F). CEA gives ideal (complete
+    combustion) values; the c* efficiency scales c* by eta and chamber temperature by eta^2,
+    which keeps them consistent since c* ~ sqrt(R * Tc).
     """
-    OF = min(max(OF, OF_MIN), OF_MAX)
-    _, cstar, Tc, MW, gamma = cea.get_IvacCstrTc_ChmMwGam(Pc=Pc, MR=OF, eps=ic["eps"])
+    lnP, OFs, v = table["lnP"], table["OF"], table["values"]
+    x = min(max(math.log(Pc), lnP[0]), lnP[-1])  # clamp to the table
+    y = min(max(OF, OF_MIN), OF_MAX)
 
-    eta = inputs["C* Efficiency"]  
+    # Grid cell containing (x, y), and how far across it the point sits (0..1 each way)
+    i = min(max(int(np.searchsorted(lnP, x)) - 1, 0), len(lnP) - 2)
+    j = min(max(int(np.searchsorted(OFs, y)) - 1, 0), len(OFs) - 2)
+    fx = (x - lnP[i]) / (lnP[i + 1] - lnP[i])
+    fy = (y - OFs[j]) / (OFs[j + 1] - OFs[j])
+    cstar, Tc, MW, gamma = ((1 - fx) * (1 - fy) * v[i, j] + fx * (1 - fy) * v[i + 1, j]
+                            + (1 - fx) * fy * v[i, j + 1] + fx * fy * v[i + 1, j + 1])
+
+    eta = inputs["C* Efficiency"]
     return {
         "cstar": eta * cstar,        # [m/s]
         "Tc": eta ** 2 * Tc,         # [K]
@@ -459,7 +493,7 @@ def chamber_state(Pc, P_ox, P_fuel, up, cea, ic, inputs):
     ox = ox_flow(P_ox, Pc, up, ic, inputs)
     m_fuel = fuel_flow(P_fuel, Pc, ic, inputs)
     OF = ox["mdot"] / m_fuel if m_fuel > 0 else OF_MAX  # no fuel flow: let combustion clamp it
-    gas = combustion(Pc, OF, cea, ic, inputs)
+    gas = combustion(Pc, OF, cea, inputs)
     P_man_fuel = Pc + m_fuel ** 2 / (2 * ic["rho_fuel"] * ic["CdA_fuel"] ** 2)  # injector's share of the drop
 
     return {
@@ -481,7 +515,7 @@ def chamber_balance(P_ox, P_fuel, up, cea, ic, inputs, tol=100.0):
     """Chamber pressure where injector flow in equals nozzle flow out, plus everything at that point.
 
     P_ox, P_fuel: tank pressures this step [Pa]; up: from ox_upstream (once per step);
-    cea: from make_cea (once per run); tol: bisection tolerance on Pc [Pa].
+    cea: table from cea_table; tol: bisection tolerance on Pc [Pa].
     """
     def mismatch(Pc):
         """Injector flow in minus nozzle flow out."""
@@ -551,7 +585,7 @@ def motor_class(total_impulse):
 def run(inputs, progress_every=100):
     """Simulate one burn. Returns {"history": arrays vs. time, "summary": totals and stop reason}."""
     ic = initial_conditions(inputs)
-    cea = make_cea(inputs)
+    cea = cea_table(inputs)
     dt = inputs["Timestep"]
     t_end = inputs["Sim Duration"]
     Pa = inputs["Ambient Pressure"]
