@@ -40,9 +40,11 @@ STARTUP_TIME = 0.010  # [s]
 STARTUP_DT = 0.001    # [s]
 
 # Column letters for each input panel on the sheet: parameter name, then (value, unit) pairs
+# (the right-hand panels have no metric column)
 PANELS = [
     {"name": "C", "imperial": ("D", "E"), "metric": ("F", "G")},
-    {"name": "L", "imperial": ("M", "N"), "metric": ("O", "P")},
+    {"name": "L", "imperial": ("M", "N")},
+    {"name": "S", "imperial": ("T", "U")},
 ]
 
 # Unit written in the spreadsheet -> function converting a value in that unit to SI
@@ -55,6 +57,7 @@ TO_SI = {
     "kg/m3": lambda x: x,
     "in": lambda x: x * 0.0254,               # -> m
     "ft": lambda x: x * 0.3048,               # -> m
+    "in2": lambda x: x * 0.0254 ** 2,         # -> m^2
     "psi": lambda x: x * 6894.757,            # -> Pa
     "F": lambda x: (x - 32) / 1.8 + 273.15,   # -> K
     "deg": math.radians,                      # -> rad
@@ -87,13 +90,13 @@ def load_inputs(path=INPUT_FILE):
     def is_typed_number(cell_ref):
         return isinstance(ws_formulas[cell_ref].value, (int, float))
 
-    # Fuel name: the dropdown to the right of the "Propellant Properties" heading
+    # Fuel name: the dropdown to the right of the "Fuel Selection" label
     for row in ws.iter_rows():
         for cell in row:
-            if cell.value == "Propellant Properties":
+            if cell.value == "Fuel Selection":
                 inputs["Fuel"] = ws.cell(cell.row, cell.column + 1).value
     if "Fuel" not in inputs:
-        raise ValueError(f"No 'Propellant Properties' heading (with the fuel dropdown beside it) in {path}")
+        raise ValueError(f"No 'Fuel Selection' label (with the fuel dropdown beside it) in {path}")
 
     # Sweep block: rows under the "Parameter | min | max | step | 0/1" header
     sweep_rows = []
@@ -110,8 +113,8 @@ def load_inputs(path=INPUT_FILE):
             if col["name"] == "C" and row in sweep_rows:
                 continue
             label = ws[f"{col['name']}{row}"].value
-            columns = (col["imperial"], col["metric"])
-            # A typed value wins; if both columns are formulas (e.g. Oxidizer Length), use the calculated one
+            columns = [c for c in (col.get("imperial"), col.get("metric")) if c]
+            # A typed value wins; if both columns are formulas (e.g. Tank Length), use the calculated one
             source = next((c for c in columns if is_typed_number(f"{c[0]}{row}")), None) \
                 or next((c for c in columns if isinstance(ws[f"{c[0]}{row}"].value, (int, float))), None)
             if not isinstance(label, str) or source is None:
@@ -184,7 +187,7 @@ def initial_conditions(inputs):
     T_ox = inputs["Nitrous Temperature"]
 
     rho_ox = PropsSI("D", "T", T_ox, "Q", 0, inputs["Oxidizer"])
-    V_ox = inputs["Oxidizer Length"] * tank_area
+    V_ox = inputs["Nitrous Length"] * tank_area
     m_ox0 = rho_ox * V_ox
 
     rho_fuel = inputs["Fuel Density"]
@@ -196,11 +199,14 @@ def initial_conditions(inputs):
 
     A_t = area(inputs["Throat Diameter"])
     A_e = area(inputs["Exit Diameter"])
-    A_oxfeed = area(inputs["Oxidizer Line Diameter"])
+    A_oxfeed = area(inputs["Nitrous Line Diameter"])
     A_fuelfeed = area(inputs["Fuel Line Diameter"])
 
-    CdA_ox = inputs["No. Oxidizer Holes"] * area(inputs["Oxidizer Hole Diameter"]) * inputs["Oxidizer Cd"]
+    CdA_ox = inputs["No. Nitrous Holes"] * area(inputs["Nitrous Hole Diameter"]) * inputs["Nitrous Cd"]
     CdA_fuel = inputs["No. Fuel Holes"] * area(inputs["Fuel Hole Diameter"]) * inputs["Fuel Cd"]
+
+    K_ox = fittings_K(inputs, "Nitrous")
+    K_fuel = fittings_K(inputs, "Fuel")
 
     return {
         "T_ox": T_ox,
@@ -219,6 +225,8 @@ def initial_conditions(inputs):
         "A_fuelfeed": A_fuelfeed,
         "CdA_ox": CdA_ox,
         "CdA_fuel": CdA_fuel,
+        "K_ox": K_ox,      # feed line fittings (entrance, elbows, ball valve)
+        "K_fuel": K_fuel,
     }
 
 def tank_pressures(m_ox, t, t_switch, ic, inputs):
@@ -257,6 +265,18 @@ def tank_pressures(m_ox, t, t_switch, ic, inputs):
     }
 
 
+def fittings_K(inputs, side):
+    """Total K-factor of one feed line's fittings: tank entrance + elbows + ball valve.
+
+    side: "Nitrous" or "Fuel" (the prefix of that line's inputs on the sheet)
+    Ball valve K from its Cv: K = 891 d^4 / Cv^2, with d the line diameter in inches.
+    """
+    d_in = inputs[f"{side} Line Diameter"] / 0.0254
+    K_valve = 891 * d_in ** 4 / inputs[f"{side} Ball Valve Cv"] ** 2
+    K_elbows = inputs[f"{side} No. Elbows"] * inputs[f"{side} Elbow K-factor"]
+    return inputs[f"{side} Entrance K-factor"] + K_elbows + K_valve
+
+
 def friction_factor(Re, rel_roughness):
     """Darcy friction factor: laminar below Re = 2300, Haaland equation above.
 
@@ -284,7 +304,7 @@ def fuel_flow(P_fuel, Pc, ic, inputs):
 
     f = 0.02  # starting guess; refined below from the Reynolds number
     for _ in range(5):
-        R_feed = (f * L / D + inputs["Fuel Sum K"]) / A_line ** 2
+        R_feed = (f * L / D + ic["K_fuel"]) / A_line ** 2
         mdot = math.sqrt(2 * rho * (P_fuel - Pc) / (R_feed + R_inj))
         Re = 4 * mdot / (math.pi * D * inputs["Fuel Dynamic Viscosity"])
         f = friction_factor(Re, inputs["Fuel Line Roughness"] / D)
@@ -340,7 +360,7 @@ def ox_upstream(P_ox, inputs, phase="liquid", n_grid=60):
         "phase": "liquid",
         "T1": T1,
         "rho1": rho_l,
-        "mu1": inputs["Oxidizer Dynamic Viscosity"],  # CoolProp has no N2O viscosity model
+        "mu1": inputs["Nitrous Dynamic Viscosity"],  # CoolProp has no N2O viscosity model
         "h1": h1,
         "s1": s1,
         "P_v": P_ox,  # saturated tank: vapor pressure = tank pressure
@@ -409,15 +429,15 @@ def ox_flow(P_ox, Pc, up, ic, inputs):
     injector_flux = nhne_flux if up["phase"] == "liquid" else gas_flux
     rho = up["rho1"]
     mu = up["mu1"]
-    D = inputs["Oxidizer Line Diameter"]
-    L = inputs["Oxidizer Line Length"]
-    rel_roughness = inputs["Oxidizer Line Roughness"] / D
+    D = inputs["Nitrous Line Diameter"]
+    L = inputs["Nitrous Line Length"]
+    rel_roughness = inputs["Nitrous Line Roughness"] / D
     A_line = ic["A_oxfeed"]
     CdA = ic["CdA_ox"]
 
     f = 0.02  # starting guess; refined below from the Reynolds number
     for _ in range(2):  # f settles after one update (N2O's high Reynolds number)
-        R_feed = (f * L / D + inputs["Oxidizer Sum K"]) / A_line ** 2
+        R_feed = (f * L / D + ic["K_ox"]) / A_line ** 2
 
         def mismatch(P_man):
             """Feed line flow minus injector flow, for a guessed manifold pressure."""
@@ -589,7 +609,7 @@ def run(inputs, progress_every=100):
     ic = initial_conditions(inputs)
     cea = cea_table(inputs)
     dt = inputs["Timestep"]
-    t_end = inputs["Sim Duration"]
+    t_end = inputs["Sim Max Duration"]
     Pa = inputs["Ambient Pressure"]
 
     # State: the only quantities carried from one step to the next
@@ -682,7 +702,7 @@ def run_sweeps(inputs, sweeps):
 
     Each case starts from a fresh copy of the inputs with the swept parameters overridden.
     Returns a list of cases: {"values": [value per sweep, spreadsheet units], "result" or "error"}.
-    Note: spreadsheet formulas (e.g. Oxidizer/Fuel Length, Nitrous Temperature) are not
+    Note: spreadsheet formulas (e.g. Tank Length, Static Vent Position) are not
     recalculated, so sweeping an input they depend on doesn't change them.
     """
     cases = []

@@ -25,17 +25,21 @@ The spreadsheet can stay open while you run the sim; Python reads the saved file
 
 ## Inputs (`input.xlsx`)
 
-Everything lives on the `input` sheet, in two panels (simulation setup and geometry on
-the left, propellant properties, efficiencies and feed losses on the right).
+Everything lives on the `input` sheet, in three panels: simulation setup, ambient
+conditions, propellant properties and efficiencies on the left; nitrous tank, injector and
+feed line, then the tank, chamber and nozzle geometry in the middle; the fuel side on the
+right. The fuel is picked from the **Fuel Selection** dropdown.
 
-- **Units:** type each value in either the Imperial or the Metric column. The sim uses
-  whichever column holds a typed number (not a formula) and converts it to SI using the
-  unit written beside it. Unknown units stop the run with an error naming the parameter.
+- **Units:** the left panel has Imperial and Metric columns; type each value in either.
+  The sim uses whichever column holds a typed number (not a formula) and converts it to SI
+  using the unit written beside it. The other panels have one value column. Unknown units
+  stop the run with an error naming the parameter.
 - **Names matter:** parameters are found by the name in their label cell, so rows can be
-  moved freely, but renaming a label renames the input.
+  moved freely, but renaming a label renames the input. Every name must be unique, so
+  inputs that exist on both feed lines are prefixed `Nitrous` or `Fuel`.
 - **Decimals, not percents:** efficiencies and discharge coefficients are fractions
   (C* efficiency `0.65`, not `65`).
-- **Formulas:** calculated cells (e.g. oxidizer and fuel column lengths) are read as their
+- **Formulas:** calculated cells (e.g. tank length, injector areas) are read as their
   last calculated value. They are *not* recalculated during sweeps (see Limitations).
 
 ### Sweeps
@@ -75,7 +79,9 @@ Each time step (10 ms, with 1 ms steps during startup):
    decays exponentially once the liquid is gone (below 10% of the starting mass). The fuel
    tank is driven by a piston: fuel pressure = oxidizer pressure − piston loss.
 2. **Feed lines** — friction (Darcy, Haaland friction factor) plus fittings as a sum of
-   K-factors (ball valve from its Cv, elbows, tank entrance), treated as resistances in series.
+   K-factors, treated as resistances in series. The sim totals the fittings from each line's
+   inputs: tank entrance K, number of elbows × elbow K, and the ball valve's K from its Cv
+   (K = 891 d⁴ / Cv², d in inches).
 3. **Injectors**
    - *Fuel:* single-phase incompressible orifice flow, solved in closed form with the line.
    - *Oxidizer, liquid phase:* the **NHNE** (non-homogeneous, non-equilibrium, Dyer) model,
