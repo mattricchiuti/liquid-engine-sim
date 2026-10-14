@@ -28,7 +28,9 @@ The spreadsheet can stay open while you run the sim; Python reads the saved file
 Everything lives on the `input` sheet, in three panels: simulation setup, ambient
 conditions, propellant properties and efficiencies on the left; nitrous tank, injector and
 feed line, then the tank, chamber and nozzle geometry in the middle; the fuel side on the
-right. The fuel is picked from the **Fuel Selection** dropdown.
+right. The fuel is picked from the **Fuel Selection** dropdown, and each injector's hole
+diameter from a dropdown of standard US drill sizes (number and fractional drills up to
+0.1 in) in its notes column; the diameter cell looks the size up from the `lists` sheet.
 
 - **Units:** the left panel has Imperial and Metric columns; type each value in either.
   The sim uses whichever column holds a typed number (not a formula) and converts it to SI
