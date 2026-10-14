@@ -61,7 +61,7 @@ entries to hide/show series). They work offline and can be shared as single file
 
 | File | When | Contents |
 |---|---|---|
-| `results.html` | single run | thrust, pressures (tanks, manifolds, chamber), injector stiffness, mass flows, O/F, Isp, propellant left, c*, chamber temperature, nozzle exit pressure vs. time |
+| `results.html` | single run | thrust, pressures (tanks, chamber), injector stiffness, mass flows, O/F, propellant left, chamber temperature, nozzle exit pressure vs. time; average Isp over the liquid phase in the title |
 | `sweep.html` | one sweep | curves over time for every case (thrust, Pc, O/F, both stiffnesses) + summary metrics vs. the swept value |
 | `sweep.html` | two sweeps | heat maps of total impulse, Isp, peak thrust, burn time, minimum stiffness |
 | `sweep_results.csv` | any sweep | one row per case: swept values and summary numbers |

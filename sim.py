@@ -604,6 +604,12 @@ def motor_class(total_impulse):
     return chr(ord("A") + math.ceil(math.log2(total_impulse / 2.5)))
 
 
+def class_percent(total_impulse):
+    """How far the impulse is through its class, 0-100% (e.g. K = 1280-2560 N*s, so 1920 N*s is 50%)."""
+    upper = 2.5 * 2 ** (ord(motor_class(total_impulse)) - ord("A"))  # top of the class; the bottom is half that
+    return 100 * (total_impulse - upper / 2) / (upper / 2)
+
+
 def run(inputs, progress_every=100):
     """Simulate one burn. Returns {"history": arrays vs. time, "summary": totals and stop reason}."""
     ic = initial_conditions(inputs)
@@ -650,7 +656,7 @@ def run(inputs, progress_every=100):
         nz = nozzle(cb, ic, inputs)
 
         # Record everything at time t
-        record = {"t": t, "dt": step_dt, "m_ox": m_ox, "m_fuel": m_fuel,
+        record = {"t": t, "dt": step_dt, "m_ox": m_ox, "m_fuel": m_fuel, "liquid": tp["phase"] == "liquid",
                   "P_ox": tp["P_ox"], "P_fuel": tp["P_fuel"], **cb, **nz}
         for name, value in record.items():
             history.setdefault(name, []).append(value)
@@ -674,6 +680,14 @@ def run(inputs, progress_every=100):
     burn_time = float(np.sum(history["dt"])) if len(F) else 0.0
     total_impulse = float(np.sum(F * history["dt"])) if len(F) else 0.0
     prop_used = (ic["m_ox0"] - m_ox) + (ic["m_fuel0"] - m_fuel)
+    # Liquid phase only (before the nitrous tank switches to vapor): impulse over propellant used in those steps
+    if len(F):
+        liq = history["liquid"]
+        dt_liq = history["dt"][liq]
+        impulse_liquid = float(np.sum(F[liq] * dt_liq))
+        prop_liquid = float(np.sum(history["mdot"][liq] * dt_liq))
+    else:
+        impulse_liquid = prop_liquid = 0.0
     summary = {
         "stop_reason": stop_reason,
         "ambient_pressure": Pa,
@@ -682,6 +696,7 @@ def run(inputs, progress_every=100):
         "average_thrust": total_impulse / burn_time if burn_time > 0 else 0.0,
         "peak_thrust": float(F.max()) if len(F) else 0.0,
         "average_Isp": total_impulse / (prop_used * G0) if prop_used > 0 else 0.0,
+        "average_Isp_liquid": impulse_liquid / (prop_liquid * G0) if prop_liquid > 0 else 0.0,
         "ox_used": ic["m_ox0"] - m_ox,
         "fuel_used": ic["m_fuel0"] - m_fuel,
         "ox_left": m_ox,
@@ -692,6 +707,7 @@ def run(inputs, progress_every=100):
         "separation_risk_any": bool(history["separation_risk"][history["t"] >= STARTUP_TIME].any()) if len(F) else False,
     }
     summary["motor"] = f"{motor_class(total_impulse)}{summary['average_thrust']:.0f}"
+    summary["class_percent"] = class_percent(total_impulse) if total_impulse > 0 else 0.0
 
     return {"history": history, "summary": summary}
 
@@ -1013,18 +1029,17 @@ def line(fig, row, col, x, y, name, color, dash=None, hover_unit="", legend=None
 
 
 def plot_results(result, path="outputs/results.html"):
-    """Single run: thrust, pressures, stiffness, flows, O/F, Isp, propellant, c*, Tc, exit pressure vs. time."""
+    """Single run: thrust, pressures, stiffness, flows, O/F, propellant, Tc, exit pressure vs. time."""
     h, s = result["history"], result["summary"]
     t = h["t"]
     burn = t >= STARTUP_TIME  # during the ramp Pc is near ambient, so ratios like stiffness spike meaninglessly
     tb = t[burn]
-    blue, orange, aqua, yellow, magenta = CATEGORICAL[:5]
+    blue, orange, aqua = CATEGORICAL[:3]
 
     titles = ["Thrust [lbf]", "Pressure [psi]", "Injector stiffness [%]", "Mass flow [kg/s]", "O/F",
-              "Isp [s]", "Propellant left [kg]", "c* with efficiency [m/s]", "Chamber temperature [K]",
-              "Nozzle exit pressure [psi]"]
-    fig = make_subplots(rows=5, cols=2, shared_xaxes=True, subplot_titles=titles,
-                        vertical_spacing=0.07, horizontal_spacing=0.08)
+              "Propellant left [kg]", "Chamber temperature [K]", "Nozzle exit pressure [psi]"]
+    fig = make_subplots(rows=4, cols=2, shared_xaxes=True, subplot_titles=titles,
+                        vertical_spacing=0.08, horizontal_spacing=0.08)
 
     lg = panel_legend(fig, 1, 1, 1)
     line(fig, 1, 1, t, h["F"] / LBF, "total", blue, hover_unit="lbf", legend=lg)
@@ -1032,8 +1047,7 @@ def plot_results(result, path="outputs/results.html"):
     line(fig, 1, 1, t, h["F_pressure"] / LBF, "pressure", aqua, "dot", "lbf", legend=lg)
 
     lg = panel_legend(fig, 2, 1, 2)
-    for (key, name), color in zip([("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("P_man_ox", "ox manifold"),
-                                   ("P_man_fuel", "fuel manifold"), ("Pc", "chamber")], CATEGORICAL):
+    for (key, name), color in zip([("P_ox", "ox tank"), ("P_fuel", "fuel tank"), ("Pc", "chamber")], CATEGORICAL):
         line(fig, 1, 2, t, h[key] / PSI, name, color, hover_unit="psi", legend=lg)
 
     lg = panel_legend(fig, 3, 2, 1)
@@ -1045,23 +1059,21 @@ def plot_results(result, path="outputs/results.html"):
     line(fig, 2, 2, t, h["mdot_ox"], "oxidizer", blue, hover_unit="kg/s", legend=lg)
     line(fig, 2, 2, t, h["mdot_fuel"], "fuel", orange, hover_unit="kg/s", legend=lg)
     line(fig, 3, 1, tb, h["OF"][burn], "O/F", blue)
-    line(fig, 3, 2, tb, h["Isp"][burn], "Isp", blue, hover_unit="s")
-    lg = panel_legend(fig, 5, 4, 1)
-    line(fig, 4, 1, t, h["m_ox"], "oxidizer", blue, hover_unit="kg", legend=lg)
-    line(fig, 4, 1, t, h["m_fuel"], "fuel", orange, hover_unit="kg", legend=lg)
-    line(fig, 4, 2, tb, h["cstar"][burn], "c*", blue, hover_unit="m/s")
-    line(fig, 5, 1, tb, h["Tc"][burn], "chamber temperature", blue, hover_unit="K")
-    line(fig, 5, 2, tb, h["Pe"][burn] / PSI, "exit pressure", blue, hover_unit="psi")
+    lg = panel_legend(fig, 5, 3, 2)
+    line(fig, 3, 2, t, h["m_ox"], "oxidizer", blue, hover_unit="kg", legend=lg)
+    line(fig, 3, 2, t, h["m_fuel"], "fuel", orange, hover_unit="kg", legend=lg)
+    line(fig, 4, 1, tb, h["Tc"][burn], "chamber temperature", blue, hover_unit="K")
+    line(fig, 4, 2, tb, h["Pe"][burn] / PSI, "exit pressure", blue, hover_unit="psi")
     Pa = s["ambient_pressure"] / PSI
-    fig.add_hline(y=Pa, line=dict(color=GUIDE_COLOR, dash="dash"), annotation_text="ambient", row=5, col=2)
+    fig.add_hline(y=Pa, line=dict(color=GUIDE_COLOR, dash="dash"), annotation_text="ambient", row=4, col=2)
     fig.add_hline(y=SEPARATION_RATIO * Pa, line=dict(color=GUIDE_COLOR, dash="dot"),
-                  annotation_text="separation risk", row=5, col=2)
+                  annotation_text="separation risk", row=4, col=2)
 
     # Shared axes keep zooming in sync; show the time axis on every panel, not just the bottom row
     fig.update_xaxes(showticklabels=True, title_text="Time [s]", title_standoff=4)
-    fig.update_layout(height=1600, hovermode="x unified")
-    title = (f"{s['motor']}   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
-             f"Isp = {s['average_Isp']:.0f} s   (stop: {s['stop_reason']})")
+    fig.update_layout(height=1300, hovermode="x unified")
+    title = (f"{s['motor']} ({s['class_percent']:.0f}%)   I = {s['total_impulse']:.0f} N·s   burn = {s['burn_time']:.2f} s   "
+             f"avg Isp = {s['average_Isp_liquid']:.0f} s   (stop: {s['stop_reason']})")
     return save_page(fig, path, title, animation_html())
 
 
